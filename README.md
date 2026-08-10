@@ -1,5 +1,14 @@
 > 📖 **英文版 / English version → [README.en.md](README.en.md)**
 
+---
+
+> ⚠️ **免责声明：AI 生成**
+>
+> 本项目（含 `agent.py`、`server.py`、测试与全部文档）由 **DeepSeek** 生成，属 AI 辅助编写，尚未经过独立的人工安全审查。
+> 使用前请自行审查代码、测试与安全相关逻辑；作者不对其正确性、安全性或适用性作任何保证。
+
+---
+
 # remote-mcp
 
 一个 MCP（Model Context Protocol）服务器，用于在**远程机器**上执行操作。远程机器上只需跑一个零依赖（仅标准库）的 HTTP 守护进程 `agent.py`。支持 Linux 和 Windows，特别适合**没有 SSH / WinRM / SMB 可用**的场景——比如一台密码空白的 Windows 机器，账户和注册表都不能动，只能靠用户态 HTTP 守护进程 + 自带 token 来访问。
