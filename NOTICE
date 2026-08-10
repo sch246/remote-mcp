@@ -1,0 +1,13 @@
+NOTICE
+======
+
+`agent.py` is a derived work based on the remote-execution agent from the
+"pi" coding-agent project — specifically the `agent.py` HTTP daemon originally
+shipped alongside pi's `http-remote` extension. It has been extracted, renamed,
+and neutralized of pi-specific references, but the wire protocol and much of
+the server implementation retain their original design. Its provenance is also
+noted in the agent.py module docstring.
+
+This project is an independent, unaffiliated re-packaging. It is not endorsed
+by, or part of, the pi project. See the LICENSE file for the terms under which
+both the original and this derived work are distributed.

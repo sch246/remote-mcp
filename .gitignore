@@ -1,0 +1,16 @@
+# Secrets / local config — never commit
+hosts.json
+agent.token
+*.token
+
+# Runtime artifacts
+*.log
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
