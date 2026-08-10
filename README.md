@@ -1,4 +1,4 @@
-> 📖 **英文版 / English version → [README.en.md](README.en.md)**
+> 📖 **English version → [README.en.md](README.en.md)**
 
 ---
 

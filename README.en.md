@@ -1,6 +1,6 @@
 # remote-mcp (English)
 
-> 📖 **中文版 / Chinese version → [README.md](README.md)**
+> 📖 **中文版 → [README.md](README.md)**
 
 ---
 
