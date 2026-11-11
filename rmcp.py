@@ -4,11 +4,14 @@ rmcp.py — Unified single-file CLI, Mesh Router, and Remote Node for remote-mcp
 
 Zero external dependencies (Python 3.10+ stdlib only). Runs identically on
 Linux and Windows. One file serves four roles:
-  1. One-shot CLI for bots & humans:
-       python rmcp.py <command...>        # pass-through to active remote node
-       python rmcp.py :<mgmt-cmd> ...     # router & node management commands
-  2. SSH stdio router hop (invoked automatically over SSH stdin/stdout):
-       python rmcp.py --stdio-hop
+  1. One-shot CLI & Interactive REPL for bots & humans:
+       python rmcp.py                      # interactive REPL (when run in a TTY)
+       python rmcp.py :repl [target]       # explicit interactive shell (persistent hop pipes)
+       python rmcp.py <command...>         # one-shot pass-through to active remote node
+       python rmcp.py :<mgmt-cmd> ...      # router & node management commands
+  2. SSH stdio router hop / persistent loop (invoked automatically over SSH stdin/stdout):
+       python rmcp.py --stdio-hop          # single framed envelope
+       python rmcp.py --stdio-loop         # persistent multiplexed framed loop
   3. HTTP daemon + Router + Reverse-Tunnel Hub (backward-compatible with agent.py):
        python rmcp.py --listen [--port 7777] [--watchdog]
   4. Outbound Reverse-Tunnel Client (for NAT / firewall-isolated machines):
@@ -17,6 +20,7 @@ Linux and Windows. One file serves four roles:
 from __future__ import annotations
 
 import argparse
+import atexit
 import base64
 import contextlib
 import hashlib
@@ -46,7 +50,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 IS_WINDOWS = sys.platform.startswith("win")
 HERE = Path(__file__).resolve().parent
 
@@ -579,6 +583,13 @@ def _run_local_exec(command: str, cwd: str | None = None, timeout: float | None 
     }
 
 
+def _resolve_remote_path(raw_path: str, cwd: str | None = None) -> Path:
+    p = Path(raw_path).expanduser()
+    if not p.is_absolute() and cwd:
+        p = Path(cwd) / p
+    return p
+
+
 def execute_local_action(action: str, params: dict) -> dict:
     """Execute a router envelope action on THIS machine."""
     state = load_router_state()
@@ -590,6 +601,7 @@ def execute_local_action(action: str, params: dict) -> dict:
             "node_id": state["node_id"],
             "alias": state["alias"],
             "hostname": socket.gethostname(),
+            "pid": os.getpid(),
             "cwd": str(Path.cwd()),
             "user": current_user(),
             "platform": sys.platform,
@@ -608,14 +620,14 @@ def execute_local_action(action: str, params: dict) -> dict:
 
     if action == "cd":
         base = Path(params.get("cwd") or Path.cwd())
-        target = Path(params.get("path") or str(Path.home()))
+        target = Path(params.get("path") or str(Path.home())).expanduser()
         resolved = (target if target.is_absolute() else (base / target)).resolve()
         if not resolved.exists() or not resolved.is_dir():
             raise ValueError(f"directory not found: {resolved}")
         return {"cwd": str(resolved)}
 
     if action == "read":
-        p = Path(params["path"])
+        p = _resolve_remote_path(params["path"], params.get("cwd"))
         if not p.exists():
             raise FileNotFoundError(f"not found: {p}")
         size = p.stat().st_size
@@ -625,7 +637,7 @@ def execute_local_action(action: str, params: dict) -> dict:
         return {"path": str(p), "size": size, "data_b64": base64.b64encode(data).decode("ascii")}
 
     if action == "write":
-        p = Path(params["path"])
+        p = _resolve_remote_path(params["path"], params.get("cwd"))
         data = base64.b64decode(params.get("data_b64", ""))
         p.parent.mkdir(parents=True, exist_ok=True)
         part = p.with_suffix(p.suffix + f".part.{os.getpid()}")
@@ -634,7 +646,7 @@ def execute_local_action(action: str, params: dict) -> dict:
         return {"ok": True, "path": str(p), "bytes": len(data)}
 
     if action == "edit":
-        p = Path(params["path"])
+        p = _resolve_remote_path(params["path"], params.get("cwd"))
         old_text = params["old_text"]
         new_text = params["new_text"]
         if not p.is_file():
@@ -652,7 +664,7 @@ def execute_local_action(action: str, params: dict) -> dict:
         return {"ok": True, "path": str(p), "bytes": len(updated)}
 
     if action == "upload_chunk":
-        p = Path(params["path"])
+        p = _resolve_remote_path(params["path"], params.get("cwd"))
         part = p.with_suffix(p.suffix + ".rmcp_part")
         offset = int(params.get("offset", 0))
         chunk = base64.b64decode(params.get("data_b64", ""))
@@ -684,7 +696,7 @@ def execute_local_action(action: str, params: dict) -> dict:
         return {"ok": True, "offset": offset + len(chunk), "finalized": False}
 
     if action == "download_chunk":
-        p = Path(params["path"])
+        p = _resolve_remote_path(params["path"], params.get("cwd"))
         if not p.is_file():
             raise FileNotFoundError(f"not found: {p}")
         offset = int(params.get("offset", 0))
@@ -1091,20 +1103,195 @@ def _send_framed_stdio(cmd: list[str], env: dict, extra_os_env: dict | None = No
     }
 
 
+class _StdioSession:
+    """Persistent multiplexed `--stdio-loop` pipe for interactive REPL & multi-chunk transfers."""
+
+    def __init__(self, cmd: list[str], extra_os_env: dict | None = None) -> None:
+        run_env = os.environ.copy()
+        if extra_os_env:
+            run_env.update(extra_os_env)
+        self.lock = threading.Lock()
+        self.requests_ok = 0
+        self.closed = False
+        self.proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=run_env,
+        )
+        self._res_q: queue.Queue[str | None] = queue.Queue()
+        self._reader = threading.Thread(target=self._read_stdout, daemon=True)
+        self._reader.start()
+
+    def _read_stdout(self) -> None:
+        assert self.proc.stdout is not None
+        try:
+            while True:
+                raw_line = self.proc.stdout.readline()
+                if not raw_line:
+                    self._res_q.put(None)
+                    break
+                line = raw_line.decode("utf-8", errors="replace")
+                idx = line.find(FRAME_RES_PREFIX)
+                if idx != -1:
+                    self._res_q.put(line[idx + len(FRAME_RES_PREFIX) :].strip())
+        except Exception:
+            self._res_q.put(None)
+
+    def is_alive(self) -> bool:
+        return not self.closed and self.proc.poll() is None and self.proc.stdin is not None
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        with contextlib.suppress(Exception):
+            if self.proc.stdin:
+                self.proc.stdin.close()
+        with contextlib.suppress(Exception):
+            self.proc.wait(timeout=0.5)
+        if self.proc.poll() is None:
+            with contextlib.suppress(Exception):
+                self.proc.kill()
+            with contextlib.suppress(Exception):
+                self.proc.wait(timeout=0.5)
+
+    def request(self, env: dict, timeout: float = 120.0) -> dict | None:
+        with self.lock:
+            if not self.is_alive():
+                self.close()
+                return None
+            assert self.proc.stdin is not None
+            wire = (
+                FRAME_REQ_PREFIX
+                + base64.b64encode(json.dumps(env, separators=(",", ":")).encode("utf-8")).decode("ascii")
+                + "\n"
+            ).encode("utf-8")
+            try:
+                self.proc.stdin.write(wire)
+                self.proc.stdin.flush()
+            except BaseException:
+                self.close()
+                return None
+
+            try:
+                b64_part = self._res_q.get(timeout=timeout)
+            except queue.Empty:
+                self.close()
+                return {"ok": False, "error": "stdio transport timed out"}
+            except BaseException:
+                self.close()
+                raise
+
+            if b64_part is None:
+                self.close()
+                return None
+            try:
+                parsed = json.loads(base64.b64decode(b64_part).decode("utf-8"))
+                self.requests_ok += 1
+                return parsed
+            except Exception as e:
+                self.close()
+                return {"ok": False, "error": f"corrupt stdio frame: {e}"}
+
+
+_STDIO_POOL_LOCK = threading.Lock()
+_STDIO_POOL: dict[str, _StdioSession] = {}
+_STDIO_LOOP_UNSUPPORTED: set[str] = set()
+_PERSISTENT_STDIO_DEPTH = 0
+
+
+def close_all_stdio_sessions() -> None:
+    with _STDIO_POOL_LOCK:
+        sessions = list(_STDIO_POOL.values())
+        _STDIO_POOL.clear()
+    for sess in sessions:
+        sess.close()
+
+
+atexit.register(close_all_stdio_sessions)
+
+
+@contextlib.contextmanager
+def persistent_stdio_context():
+    """Keep SSH / stdio-loop peer pipes open across commands within this context."""
+    global _PERSISTENT_STDIO_DEPTH
+    with _STDIO_POOL_LOCK:
+        _PERSISTENT_STDIO_DEPTH += 1
+    try:
+        yield
+    finally:
+        should_close = False
+        with _STDIO_POOL_LOCK:
+            _PERSISTENT_STDIO_DEPTH = max(0, _PERSISTENT_STDIO_DEPTH - 1)
+            if _PERSISTENT_STDIO_DEPTH == 0:
+                should_close = True
+        if should_close:
+            close_all_stdio_sessions()
+
+
+def _send_persistent_or_oneshot_stdio(
+    peer_key: str,
+    loop_cmd: list[str],
+    hop_cmd: list[str],
+    env: dict,
+    extra_os_env: dict | None = None,
+    timeout: float = 120.0,
+) -> dict:
+    with _STDIO_POOL_LOCK:
+        use_pool = _PERSISTENT_STDIO_DEPTH > 0 and peer_key not in _STDIO_LOOP_UNSUPPORTED
+
+    if use_pool:
+        for attempt in range(2):
+            with _STDIO_POOL_LOCK:
+                sess = _STDIO_POOL.get(peer_key)
+                if sess is None or not sess.is_alive():
+                    if sess is not None:
+                        sess.close()
+                    try:
+                        sess = _StdioSession(loop_cmd, extra_os_env=extra_os_env)
+                        _STDIO_POOL[peer_key] = sess
+                    except Exception:
+                        sess = None
+            if sess is None:
+                break
+            was_warm = sess.requests_ok > 0
+            resp = sess.request(env, timeout=timeout)
+            if resp is not None:
+                return resp
+            with _STDIO_POOL_LOCK:
+                if _STDIO_POOL.get(peer_key) is sess:
+                    _STDIO_POOL.pop(peer_key, None)
+            if not was_warm:
+                # First request on `--stdio-loop` failed (peer may be older rmcp.py or unreachable)
+                with _STDIO_POOL_LOCK:
+                    _STDIO_LOOP_UNSUPPORTED.add(peer_key)
+                break
+            # Warm session dropped mid-flight; loop once to reconnect cleanly
+            if attempt == 1:
+                break
+
+    return _send_framed_stdio(hop_cmd, env, extra_os_env=extra_os_env, timeout=timeout)
+
+
 def send_via_ssh(peer: dict, env: dict, timeout: float = 120.0) -> dict:
     # Support local://state_dir transport for zero-SSH multi-hop router testing
     target = str(peer.get("target", ""))
     if target.startswith("local://"):
         peer_state_dir = target[len("local://") :]
         script = peer.get("remote_path") or str(Path(__file__).resolve())
-        return _send_framed_stdio(
-            [sys.executable, script, "--stdio-hop"],
-            env,
-            extra_os_env={
-                "REMOTE_MCP_STATE_DIR": peer_state_dir,
-                "RMCP_STATE_DIR": peer_state_dir,
-                "REMOTE_MCP_NODE_ALIAS": peer.get("alias", ""),
-            },
+        extra_env = {
+            "REMOTE_MCP_STATE_DIR": peer_state_dir,
+            "RMCP_STATE_DIR": peer_state_dir,
+            "REMOTE_MCP_NODE_ALIAS": peer.get("alias", ""),
+        }
+        return _send_persistent_or_oneshot_stdio(
+            peer_key=f"local:{peer_state_dir}:{script}",
+            loop_cmd=[sys.executable, script, "--stdio-loop"],
+            hop_cmd=[sys.executable, script, "--stdio-hop"],
+            env=env,
+            extra_os_env=extra_env,
             timeout=timeout,
         )
 
@@ -1112,9 +1299,14 @@ def send_via_ssh(peer: dict, env: dict, timeout: float = 120.0) -> dict:
     rpath = (peer.get("remote_path") or "~/.rmcp/rmcp.py").replace("\\", "/")
     quoted_py = f'"{py_exe}"' if " " in py_exe else py_exe
     quoted_rpath = f'"{rpath}"' if (" " in rpath and not rpath.startswith("~")) else rpath
-    remote_cmd = f"{quoted_py} {quoted_rpath} --stdio-hop"
-    ssh_cmd = _ssh_base_cmd(target, peer.get("ssh_port")) + [remote_cmd]
-    return _send_framed_stdio(ssh_cmd, env, timeout=timeout)
+    base_ssh = _ssh_base_cmd(target, peer.get("ssh_port"))
+    return _send_persistent_or_oneshot_stdio(
+        peer_key=f"ssh:{target}:{peer.get('ssh_port') or 22}:{rpath}",
+        loop_cmd=base_ssh + [f"{quoted_py} {quoted_rpath} --stdio-loop"],
+        hop_cmd=base_ssh + [f"{quoted_py} {quoted_rpath} --stdio-hop"],
+        env=env,
+        timeout=timeout,
+    )
 
 
 def _http_request_json(
@@ -1927,12 +2119,47 @@ def run_stdio_hop() -> int:
     return 0
 
 
+def run_stdio_loop() -> int:
+    """Persistent multiplexed router loop over stdin/stdout (keeps downstream hops warm too)."""
+    with persistent_stdio_context():
+        while True:
+            raw_line = sys.stdin.buffer.readline()
+            if not raw_line:
+                break
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            if not line:
+                continue
+            idx = line.find(FRAME_REQ_PREFIX)
+            if idx == -1:
+                continue
+            b64_part = line[idx + len(FRAME_REQ_PREFIX) :].strip()
+            try:
+                env = json.loads(base64.b64decode(b64_part).decode("utf-8"))
+                resp = route_envelope(env)
+            except Exception as e:
+                resp = {"ok": False, "error": f"stdio-loop error: {e}"}
+            out_frame = (
+                FRAME_RES_PREFIX
+                + base64.b64encode(json.dumps(resp, separators=(",", ":")).encode("utf-8")).decode("ascii")
+                + "\n"
+            )
+            sys.stdout.buffer.write(out_frame.encode("utf-8"))
+            sys.stdout.buffer.flush()
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # CLI Helpers & Colon-Command Dispatcher (One-Shot Bot & Human Friendly)
 # ---------------------------------------------------------------------------
 
 _MGMT_COMMANDS = {
     "help",
+    "repl",
+    "shell",
+    "local",
+    "q",
+    "quit",
+    "exit",
     "id",
     "whoami",
     "nodes",
@@ -2031,8 +2258,14 @@ def _spawn_detached_self(child_args: list[str], log_path: Path) -> int:
     return proc.pid
 
 
-def _cli_upload(target: str, local_path: str, remote_path: str, timeout: float = 120.0) -> int:
-    src = Path(local_path)
+def _cli_upload(
+    target: str,
+    local_path: str,
+    remote_path: str,
+    cwd: str | None = None,
+    timeout: float = 120.0,
+) -> int:
+    src = Path(local_path).expanduser()
     if not src.is_file():
         sys.stderr.write(f"[rmcp] local file not found: {src}\n")
         return 1
@@ -2045,7 +2278,7 @@ def _cli_upload(target: str, local_path: str, remote_path: str, timeout: float =
     expected_sha = h.hexdigest()
 
     offset = 0
-    with src.open("rb") as f:
+    with persistent_stdio_context(), src.open("rb") as f:
         while True:
             chunk = f.read(STREAM_CHUNK)
             eof = (offset + len(chunk)) >= size
@@ -2054,6 +2287,7 @@ def _cli_upload(target: str, local_path: str, remote_path: str, timeout: float =
                 "upload_chunk",
                 {
                     "path": remote_path,
+                    "cwd": cwd,
                     "offset": offset,
                     "data_b64": base64.b64encode(chunk).decode("ascii"),
                     "finalize": eof,
@@ -2075,8 +2309,14 @@ def _cli_upload(target: str, local_path: str, remote_path: str, timeout: float =
                 return 0
 
 
-def _cli_download(target: str, remote_path: str, local_path: str, timeout: float = 120.0) -> int:
-    dst = Path(local_path)
+def _cli_download(
+    target: str,
+    remote_path: str,
+    local_path: str,
+    cwd: str | None = None,
+    timeout: float = 120.0,
+) -> int:
+    dst = Path(local_path).expanduser()
     dst.parent.mkdir(parents=True, exist_ok=True)
     part = dst.with_suffix(dst.suffix + f".rmcp_dl.{os.getpid()}")
     offset = 0
@@ -2085,12 +2325,12 @@ def _cli_download(target: str, remote_path: str, local_path: str, timeout: float
     via_str = target
 
     try:
-        with part.open("wb") as f:
+        with persistent_stdio_context(), part.open("wb") as f:
             while True:
                 resp = send_action(
                     target,
                     "download_chunk",
-                    {"path": remote_path, "offset": offset, "length": STREAM_CHUNK},
+                    {"path": remote_path, "cwd": cwd, "offset": offset, "length": STREAM_CHUNK},
                     timeout=timeout,
                 )
                 if not resp.get("ok"):
@@ -2131,11 +2371,15 @@ def _print_help() -> None:
         f"""rmcp v{VERSION} — Unified Multi-Hop Mesh Router & CLI for remote-mcp
 
 Usage:
+  rmcp                                    Start interactive REPL (in a TTY; prints help for bots)
+  rmcp -i | :repl [target]                Start interactive shell with persistent multi-hop pipes
   rmcp <command...>                       Run shell command on active remote node (cwd preserved)
   rmcp --to <node> <command...>           Run one-shot command on <node> without switching active
   rmcp :<mgmt-cmd> [args...]              Execute rmcp mesh/node management command
 
 Mesh & Routing Commands:
+  :repl | :shell [target]                 Enter interactive REPL (inside REPL: :q / exit, !<cmd>)
+  :local <command...>                     Run a command on THIS local machine without switching :use
   :id                                     Show this machine's deterministic node_id & alias
   :nodes | :peers | :routes [target]      Show local (or remote node's) known peers & cached routes
   :connect <alias> <endpoint> [options]   Connect & record a peer edge (SSH preferred, HTTP fallback)
@@ -2200,6 +2444,48 @@ def _pop_flag(args: list[str], flag: str, has_value: bool = False) -> tuple[bool
     return found, val, rest
 
 
+def _exec_remote_shell(
+    target: str,
+    cmd_str: str,
+    state: dict,
+    exec_timeout: float = 120.0,
+    persist_cwd: bool = True,
+) -> int:
+    cur_cwd = state.get("cwds", {}).get(target) if persist_cwd else str(Path.cwd())
+    resp = send_action(
+        target,
+        "exec",
+        {"command": cmd_str, "cwd": cur_cwd, "timeout": exec_timeout},
+        timeout=exec_timeout + 15.0,
+    )
+    if not resp.get("ok"):
+        sys.stderr.write(f"[rmcp] exec error on '{target}': {resp.get('error')}\n")
+        return 1
+
+    res = resp.get("result") or {}
+    new_cwd = res.get("cwd")
+    if persist_cwd and new_cwd and new_cwd != cur_cwd:
+        with _STATE_LOCK:
+            st = load_router_state()
+            st["cwds"][target] = new_cwd
+            save_router_state(st)
+
+    out_s = res.get("stdout") or ""
+    err_s = res.get("stderr") or ""
+    if out_s:
+        sys.stdout.flush()
+        sys.stdout.buffer.write(out_s.encode("utf-8", errors="replace"))
+        sys.stdout.buffer.flush()
+    if err_s:
+        sys.stderr.flush()
+        sys.stderr.buffer.write(err_s.encode("utf-8", errors="replace"))
+        sys.stderr.buffer.flush()
+    if res.get("timed_out"):
+        sys.stderr.write(f"\n[rmcp] command timed out after {exec_timeout}s\n")
+        return 124
+    return int(res.get("exit_code", 0))
+
+
 def _handle_mgmt_command(cmd: str, args: list[str], explicit_to: str = "") -> int:
     if cmd not in _MGMT_COMMANDS:
         sys.stderr.write(f"[rmcp] unknown management command ':{cmd}'. Run `rmcp :help` for usage.\n")
@@ -2209,7 +2495,21 @@ def _handle_mgmt_command(cmd: str, args: list[str], explicit_to: str = "") -> in
         _print_help()
         return 0
 
+    if cmd in ("q", "quit", "exit"):
+        return 0
+
+    if cmd in ("repl", "shell"):
+        init_tgt = args[0] if args else ""
+        return run_repl(initial_target=init_tgt, pinned_to=explicit_to)
+
     state = load_router_state()
+
+    if cmd == "local":
+        if not args:
+            sys.stderr.write("Usage: rmcp :local <command...>\n")
+            return 2
+        cmd_str = _format_passthrough_cmd(args, IS_WINDOWS)
+        return _exec_remote_shell("self", cmd_str, state, exec_timeout=120.0, persist_cwd=False)
 
     if cmd in ("id", "whoami"):
         if args and args[0] == "--alias" and len(args) >= 2:
@@ -2516,15 +2816,18 @@ def _handle_mgmt_command(cmd: str, args: list[str], explicit_to: str = "") -> in
         print(new_cwd)
         return 0
 
+    cur_cwd = state.get("cwds", {}).get(target)
+
     if cmd == "read":
         if not args:
             sys.stderr.write("Usage: rmcp :read <remote_path>\n")
             return 2
-        resp = send_action(target, "read", {"path": args[0]})
+        resp = send_action(target, "read", {"path": args[0], "cwd": cur_cwd})
         if not resp.get("ok"):
             sys.stderr.write(f"[rmcp] :read failed on '{target}': {resp.get('error')}\n")
             return 1
         raw = base64.b64decode((resp.get("result") or {}).get("data_b64", ""))
+        sys.stdout.flush()
         sys.stdout.buffer.write(raw)
         sys.stdout.buffer.flush()
         return 0
@@ -2537,7 +2840,7 @@ def _handle_mgmt_command(cmd: str, args: list[str], explicit_to: str = "") -> in
         resp = send_action(
             target,
             "write",
-            {"path": args[0], "data_b64": base64.b64encode(content).decode("ascii")},
+            {"path": args[0], "cwd": cur_cwd, "data_b64": base64.b64encode(content).decode("ascii")},
         )
         if not resp.get("ok"):
             sys.stderr.write(f"[rmcp] :write failed on '{target}': {resp.get('error')}\n")
@@ -2552,7 +2855,7 @@ def _handle_mgmt_command(cmd: str, args: list[str], explicit_to: str = "") -> in
         resp = send_action(
             target,
             "edit",
-            {"path": args[0], "old_text": args[1], "new_text": args[2]},
+            {"path": args[0], "cwd": cur_cwd, "old_text": args[1], "new_text": args[2]},
         )
         if not resp.get("ok"):
             sys.stderr.write(f"[rmcp] :edit failed on '{target}': {resp.get('error')}\n")
@@ -2564,13 +2867,13 @@ def _handle_mgmt_command(cmd: str, args: list[str], explicit_to: str = "") -> in
         if len(args) < 2:
             sys.stderr.write("Usage: rmcp :upload <local_path> <remote_path>\n")
             return 2
-        return _cli_upload(target, args[0], args[1])
+        return _cli_upload(target, args[0], args[1], cwd=cur_cwd)
 
     if cmd == "download":
         if len(args) < 2:
             sys.stderr.write("Usage: rmcp :download <remote_path> <local_path>\n")
             return 2
-        return _cli_download(target, args[0], args[1])
+        return _cli_download(target, args[0], args[1], cwd=cur_cwd)
 
     if cmd in ("ps", "proclist"):
         resp = send_action(target, "list", {})
@@ -2587,7 +2890,6 @@ def _handle_mgmt_command(cmd: str, args: list[str], explicit_to: str = "") -> in
             sys.stderr.write("Usage: rmcp :spawn <command...> [--stdout <path>]\n")
             return 2
         cmd_str = _format_passthrough_cmd(args, _is_target_windows(target, state))
-        cur_cwd = state.get("cwds", {}).get(target)
         resp = send_action(
             target,
             "spawn",
@@ -2624,15 +2926,341 @@ def _handle_mgmt_command(cmd: str, args: list[str], explicit_to: str = "") -> in
     return 2
 
 
+# ---------------------------------------------------------------------------
+# Interactive REPL Shell (Persistent Multi-Hop Pipes + History + Completion)
+# ---------------------------------------------------------------------------
+
+def _is_interactive_tty() -> bool:
+    if os.environ.get("RMCP_NO_REPL"):
+        return False
+    return bool(
+        sys.stdin is not None
+        and sys.stdout is not None
+        and hasattr(sys.stdin, "isatty")
+        and hasattr(sys.stdout, "isatty")
+        and sys.stdin.isatty()
+        and sys.stdout.isatty()
+    )
+
+
+def _enable_windows_vt_ansi() -> bool:
+    if not IS_WINDOWS:
+        return True
+    try:
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        handle = k32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+        mode = ctypes.c_uint32()
+        if not k32.GetConsoleMode(handle, ctypes.byref(mode)):
+            return False
+        # ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+        return bool(k32.SetConsoleMode(handle, mode.value | 0x0004))
+    except Exception:
+        return False
+
+
+def _split_repl_args(line: str) -> list[str]:
+    """Split a REPL `:mgmt` line into tokens while preserving Windows backslashes `\\`."""
+    tokens: list[str] = []
+    cur: list[str] = []
+    in_token = False
+    quote: str | None = None
+    i = 0
+    n = len(line)
+
+    while i < n:
+        ch = line[i]
+        if quote is None:
+            if ch.isspace():
+                if in_token:
+                    tokens.append("".join(cur))
+                    cur.clear()
+                    in_token = False
+                i += 1
+                continue
+            if ch in ("'", '"'):
+                quote = ch
+                in_token = True
+                i += 1
+                continue
+            cur.append(ch)
+            in_token = True
+            i += 1
+        elif quote == "'":
+            if ch == "'":
+                quote = None
+            else:
+                cur.append(ch)
+            i += 1
+        else:  # double quote '"'
+            if ch == '"':
+                quote = None
+                i += 1
+            elif ch == "\\" and i + 1 < n and line[i + 1] == '"':
+                cur.append('"')
+                i += 2
+            else:
+                cur.append(ch)
+                i += 1
+
+    if in_token:
+        tokens.append("".join(cur))
+    return tokens
+
+
+def _shorten_cwd_for_prompt(cwd: str, is_local: bool) -> str:
+    if not cwd:
+        return "~" if is_local else "."
+    if is_local:
+        home = str(Path.home())
+        if cwd == home:
+            return "~"
+        if cwd.startswith(home + os.sep):
+            cwd = "~" + cwd[len(home) :]
+    sep = "\\" if ("\\" in cwd and "/" not in cwd) else "/"
+    parts = [p for p in cwd.split(sep) if p]
+    if len(parts) > 3 and len(cwd) > 38:
+        prefix = cwd[:3] if (len(cwd) >= 3 and cwd[1:3] == ":\\") else (sep if cwd.startswith(sep) else "")
+        return f"{prefix}...{sep}{sep.join(parts[-2:])}"
+    return cwd
+
+
+def _format_repl_prompt(target: str, cwd: str, last_rc: int, use_color: bool) -> str:
+    is_loc = target in ("self", "local")
+    short_cwd = _shorten_cwd_for_prompt(cwd, is_loc)
+    rc_part = f" !{last_rc}" if last_rc != 0 else ""
+    if not use_color:
+        return f"[{target} {short_cwd}{rc_part}]> "
+    # Note: \001 / \002 wrap non-printing ANSI codes so readline calculates cursor width accurately
+    c_target = "\001\x1b[1;36m\002" if not is_loc else "\001\x1b[1;32m\002"
+    c_cwd = "\001\x1b[0;33m\002"
+    c_err = "\001\x1b[1;31m\002"
+    c_rst = "\001\x1b[0m\002"
+    err_seg = f" {c_err}!{last_rc}{c_rst}" if last_rc != 0 else ""
+    return f"[{c_target}{target}{c_rst} {c_cwd}{short_cwd}{c_rst}{err_seg}]> "
+
+
+def _setup_repl_readline():
+    try:
+        import readline
+    except Exception:
+        return None, None
+
+    hist_file = get_state_dir() / "repl_history"
+    with contextlib.suppress(Exception):
+        if hist_file.exists():
+            readline.read_history_file(str(hist_file))
+        readline.set_history_length(500)
+
+    def _completer(text: str, state_idx: int) -> str | None:
+        buf = readline.get_line_buffer().lstrip()
+        options: list[str] = []
+        if buf.startswith(":") and " " not in buf:
+            options = sorted(f":{c}" for c in _MGMT_COMMANDS if f":{c}".startswith(text.lower()))
+        elif buf.startswith((":use ", ":to ", ":ping ", ":env ", ":nodes ", ":disconnect ", ":rm ")):
+            st = load_router_state()
+            known = sorted(
+                {"self", *st.get("peers", {}).keys(), *st.get("routes", {}).keys()}
+            )
+            options = [n for n in known if n.startswith(text)]
+        return options[state_idx] if state_idx < len(options) else None
+
+    with contextlib.suppress(Exception):
+        readline.set_completer_delims(" \t\n")
+        readline.set_completer(_completer)
+        doc = getattr(readline, "__doc__", "") or ""
+        if "libedit" in doc:
+            readline.parse_and_bind("bind ^I rl_complete")
+        else:
+            readline.parse_and_bind("tab: complete")
+
+    return readline, hist_file
+
+
+def run_repl(
+    initial_target: str = "",
+    pinned_to: str = "",
+    exec_timeout: float = 120.0,
+) -> int:
+    """Interactive REPL shell with persistent multi-hop pipes, history, and `:mgmt` commands."""
+    is_tty = _is_interactive_tty()
+    use_color = bool(is_tty and not os.environ.get("NO_COLOR") and _enable_windows_vt_ansi())
+    readline_mod, hist_file = _setup_repl_readline() if is_tty else (None, None)
+    last_rc = 0
+
+    with persistent_stdio_context():
+        if initial_target:
+            rc = _handle_mgmt_command("use", [initial_target])
+            if rc != 0:
+                return rc
+            pinned_to = ""
+
+        state = load_router_state()
+        cur_target = _resolve_active_target(pinned_to, state)
+
+        # Warm up remote pipe & fetch initial cwd if unknown
+        via_banner = cur_target
+        if not _is_local_target(cur_target, state):
+            probe = send_action(cur_target, "ping", {}, timeout=15.0)
+            if probe.get("ok"):
+                pinfo = probe.get("result") or {}
+                via_banner = " -> ".join(probe.get("via") or [cur_target])
+                if pinfo.get("cwd") and cur_target not in state.get("cwds", {}):
+                    with _STATE_LOCK:
+                        st = load_router_state()
+                        st["cwds"][cur_target] = pinfo["cwd"]
+                        save_router_state(st)
+        else:
+            with _STATE_LOCK:
+                st = load_router_state()
+                st["cwds"].setdefault("self", str(Path.cwd()))
+                save_router_state(st)
+
+        if is_tty:
+            print(
+                f"[rmcp v{VERSION}] interactive mode -> {cur_target} (via {via_banner}) | "
+                ":help for commands, !<cmd> for local shell, :q to exit",
+                flush=True,
+            )
+
+        try:
+            while True:
+                state = load_router_state()
+                cur_target = _resolve_active_target(pinned_to, state)
+                cur_cwd = state.get("cwds", {}).get(cur_target) or (
+                    str(Path.cwd()) if _is_local_target(cur_target, state) else ""
+                )
+
+                try:
+                    if is_tty:
+                        raw_line = input(_format_repl_prompt(cur_target, cur_cwd, last_rc, use_color))
+                    else:
+                        raw_line = sys.stdin.readline()
+                        if raw_line == "":
+                            break
+                except KeyboardInterrupt:
+                    if is_tty:
+                        sys.stdout.write("^C\n")
+                        sys.stdout.flush()
+                    last_rc = 130
+                    continue
+                except EOFError:
+                    if is_tty:
+                        sys.stdout.write("\n")
+                        sys.stdout.flush()
+                    break
+
+                stripped = raw_line.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+
+                if stripped in (":q", ":quit", ":exit", "exit", "quit"):
+                    break
+
+                try:
+                    # 1. `!<cmd>` or `:local <cmd>` runs raw command on THIS local machine
+                    if stripped.startswith("!"):
+                        local_cmd = stripped[1:].strip()
+                        if local_cmd:
+                            last_rc = _exec_remote_shell(
+                                "self", local_cmd, state, exec_timeout=exec_timeout, persist_cwd=False
+                            )
+                        continue
+
+                    if stripped == ":local" or stripped.startswith(":local "):
+                        local_cmd = stripped[len(":local") :].strip()
+                        if not local_cmd:
+                            sys.stderr.write("Usage: :local <command...>\n")
+                            last_rc = 2
+                        else:
+                            last_rc = _exec_remote_shell(
+                                "self", local_cmd, state, exec_timeout=exec_timeout, persist_cwd=False
+                            )
+                        continue
+
+                    # 2. Check optional leading `--to` / `--timeout` or `:mgmt` command
+                    line_to = pinned_to
+                    line_timeout = exec_timeout
+                    if stripped.startswith("--to") or stripped.startswith("--timeout"):
+                        parts = _split_repl_args(stripped)
+                        idx = 0
+                        while idx < len(parts):
+                            if parts[idx] == "--to" and idx + 1 < len(parts):
+                                line_to = parts[idx + 1]
+                                idx += 2
+                                continue
+                            if parts[idx].startswith("--to="):
+                                line_to = parts[idx].split("=", 1)[1]
+                                idx += 1
+                                continue
+                            if parts[idx] == "--timeout" and idx + 1 < len(parts):
+                                line_timeout = float(parts[idx + 1])
+                                idx += 2
+                                continue
+                            if parts[idx].startswith("--timeout="):
+                                line_timeout = float(parts[idx].split("=", 1)[1])
+                                idx += 1
+                                continue
+                            break
+                        rem_parts = parts[idx:]
+                        if not rem_parts:
+                            continue
+                        mcmd = _detect_mgmt_command(rem_parts[0])
+                        if mcmd is not None:
+                            last_rc = _handle_mgmt_command(mcmd, rem_parts[1:], explicit_to=line_to)
+                            if mcmd in ("use", "to", "connect") and last_rc == 0:
+                                pinned_to = ""
+                            continue
+                        tgt = _resolve_active_target(line_to, state)
+                        cmd_str = _format_passthrough_cmd(rem_parts, _is_target_windows(tgt, state))
+                        last_rc = _exec_remote_shell(tgt, cmd_str, state, exec_timeout=line_timeout)
+                        continue
+
+                    tokens = _split_repl_args(stripped) if stripped.startswith(":") else []
+                    mgmt_cmd = _detect_mgmt_command(tokens[0]) if tokens else None
+                    if mgmt_cmd is not None:
+                        if mgmt_cmd in ("repl", "shell"):
+                            if len(tokens) > 1:
+                                last_rc = _handle_mgmt_command("use", tokens[1:])
+                                if last_rc == 0:
+                                    pinned_to = ""
+                            continue
+                        last_rc = _handle_mgmt_command(mgmt_cmd, tokens[1:], explicit_to=line_to)
+                        sys.stdout.flush()
+                        sys.stderr.flush()
+                        if mgmt_cmd in ("use", "to", "connect") and last_rc == 0:
+                            pinned_to = ""
+                        continue
+
+                    # 3. Raw shell command pass-through (pipes |, &&, >, quotes all intact!)
+                    last_rc = _exec_remote_shell(cur_target, stripped, state, exec_timeout=line_timeout)
+                except KeyboardInterrupt:
+                    close_all_stdio_sessions()
+                    sys.stderr.write("\n^C [interrupted]\n")
+                    last_rc = 130
+        finally:
+            if readline_mod is not None and hist_file is not None:
+                with contextlib.suppress(Exception):
+                    hist_file.parent.mkdir(parents=True, exist_ok=True)
+                    readline_mod.write_history_file(str(hist_file))
+
+    return last_rc
+
+
 def cli_main(argv: list[str] | None = None) -> int:
     raw = list(sys.argv[1:] if argv is None else argv)
     if not raw:
+        if _is_interactive_tty():
+            return run_repl()
         _print_help()
         return 0
 
     # 1. Node daemon / internal transport modes
     if raw[0] == "--stdio-hop":
         return run_stdio_hop()
+
+    if raw[0] == "--stdio-loop":
+        return run_stdio_loop()
 
     if raw[0] == "--watchdog":
         run_watchdog(raw[1:])
@@ -2677,8 +3305,14 @@ def cli_main(argv: list[str] | None = None) -> int:
 
     rem = raw[idx:]
     if not rem:
+        if _is_interactive_tty():
+            return run_repl(pinned_to=explicit_to, exec_timeout=exec_timeout)
         _print_help()
         return 0
+
+    if rem[0] in ("-i", "--repl", "--interactive"):
+        init_tgt = rem[1] if len(rem) > 1 else ""
+        return run_repl(initial_target=init_tgt, pinned_to=explicit_to, exec_timeout=exec_timeout)
 
     # 3. Colon management command (`:use`, `:nodes`, ...) vs normal shell command pass-through
     mgmt_cmd = _detect_mgmt_command(rem[0])
@@ -2688,38 +3322,7 @@ def cli_main(argv: list[str] | None = None) -> int:
     state = load_router_state()
     target = _resolve_active_target(explicit_to, state)
     cmd_str = _format_passthrough_cmd(rem, _is_target_windows(target, state))
-    cur_cwd = state.get("cwds", {}).get(target)
-
-    resp = send_action(
-        target,
-        "exec",
-        {"command": cmd_str, "cwd": cur_cwd, "timeout": exec_timeout},
-        timeout=exec_timeout + 15.0,
-    )
-    if not resp.get("ok"):
-        sys.stderr.write(f"[rmcp] exec error on '{target}': {resp.get('error')}\n")
-        return 1
-
-    res = resp.get("result") or {}
-    new_cwd = res.get("cwd")
-    if new_cwd and new_cwd != cur_cwd:
-        with _STATE_LOCK:
-            st = load_router_state()
-            st["cwds"][target] = new_cwd
-            save_router_state(st)
-
-    out_s = res.get("stdout") or ""
-    err_s = res.get("stderr") or ""
-    if out_s:
-        sys.stdout.buffer.write(out_s.encode("utf-8", errors="replace"))
-        sys.stdout.buffer.flush()
-    if err_s:
-        sys.stderr.buffer.write(err_s.encode("utf-8", errors="replace"))
-        sys.stderr.buffer.flush()
-    if res.get("timed_out"):
-        sys.stderr.write(f"\n[rmcp] command timed out after {exec_timeout}s\n")
-        return 124
-    return int(res.get("exit_code", 0))
+    return _exec_remote_shell(target, cmd_str, state, exec_timeout=exec_timeout)
 
 
 if __name__ == "__main__":

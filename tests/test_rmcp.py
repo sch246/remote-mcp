@@ -328,5 +328,164 @@ class LegacyAgentCompatTest(unittest.TestCase):
             srv.server_close()
 
 
+class InteractiveReplAndPersistentHopTest(unittest.TestCase):
+    def test_repl_arg_splitter_and_prompt_formatting(self):
+        self.assertEqual(
+            rmcp._split_repl_args(r':download "D:\my folder\a.txt" C:\Users\98000\b.txt'),
+            [":download", r"D:\my folder\a.txt", r"C:\Users\98000\b.txt"],
+        )
+        self.assertEqual(
+            rmcp._split_repl_args(':write note.txt "hello \\"world\\" 喵"'),
+            [":write", "note.txt", 'hello "world" 喵'],
+        )
+        self.assertEqual(
+            rmcp._format_repl_prompt("win", r"D:\github\remote-mcp", 0, use_color=False),
+            r"[win D:\github\remote-mcp]> ",
+        )
+        self.assertEqual(
+            rmcp._format_repl_prompt("win", r"D:\github", 42, use_color=False),
+            r"[win D:\github !42]> ",
+        )
+
+    def test_non_tty_no_args_prints_help_without_blocking(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            res = run_cli(Path(tmp) / "bot_state")
+            self.assertEqual(res.returncode, 0)
+            self.assertIn("Usage:", res.stdout)
+
+    def test_multihop_repl_session_and_persistent_stdio_loop_reuse(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            dir_a = base / "nodeA"
+            dir_b = base / "nodeB"
+            dir_c = base / "nodeC"
+            work_dir = base / "repl_work"
+            work_dir.mkdir(parents=True, exist_ok=True)
+
+            for d, name in ((dir_a, "nodeA"), (dir_b, "nodeB"), (dir_c, "nodeC")):
+                self.assertEqual(run_cli(d, ":id", "--alias", name).returncode, 0)
+
+            # 2-hop chain: nodeA -> nodeB -> nodeC
+            self.assertEqual(run_cli(dir_a, ":connect", "nodeB", f"local://{dir_b}").returncode, 0)
+            self.assertEqual(run_cli(dir_b, ":connect", "nodeC", f"local://{dir_c}").returncode, 0)
+
+            py = f'"{sys.executable}"' if " " in sys.executable else sys.executable
+            repl_script = "\n".join(
+                [
+                    "# 1. Two consecutive pings to nodeC must hit the EXACT SAME persistent --stdio-loop PID!",
+                    f'{py} -c "print(\'MARK_P1\')"',
+                    ":ping",
+                    f'{py} -c "print(\'MARK_P2\')"',
+                    ":ping",
+                    f'{py} -c "print(\'MARK_P3\')"',
+                    f':cd "{work_dir}"',
+                    ":write rel_hello.txt 你好交互模式🐾",
+                    ":read rel_hello.txt",
+                    "",
+                    f'{py} -c "print(\'\\nREPL_RAW_OK\')"',
+                    "!echo LOCAL_BANG_OK",
+                    ":use nodeB",
+                    f'{py} -c "print(\'SWITCHED_TO_B\')"',
+                    ":q",
+                    "",
+                ]
+            )
+
+            env = os.environ.copy()
+            env["REMOTE_MCP_STATE_DIR"] = str(dir_a)
+            env["RMCP_STATE_DIR"] = str(dir_a)
+            env["PYTHONIOENCODING"] = "utf-8"
+
+            proc = subprocess.run(
+                [sys.executable, RMCP_SCRIPT, ":repl", "nodeC"],
+                input=repl_script,
+                env=env,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                timeout=30,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            out = proc.stdout
+
+            # Extract the two :ping JSON blobs between markers and verify remote PID reuse!
+            _, after_p1 = out.split("MARK_P1", 1)
+            ping1_txt, after_p2 = after_p1.split("MARK_P2", 1)
+            ping2_txt, rest = after_p2.split("MARK_P3", 1)
+
+            # First JSON object in ping1_txt & ping2_txt
+            p1_json = json.loads(ping1_txt[ping1_txt.index("{") : ping1_txt.rindex("}") + 1])
+            p2_json = json.loads(ping2_txt[ping2_txt.index("{") : ping2_txt.rindex("}") + 1])
+            self.assertEqual(p1_json["via"], ["nodeA", "nodeB", "nodeC"])
+            self.assertEqual(p2_json["via"], ["nodeA", "nodeB", "nodeC"])
+            self.assertEqual(
+                p1_json["result"]["pid"],
+                p2_json["result"]["pid"],
+                "Persistent --stdio-loop should reuse the same multi-hop worker process across REPL commands",
+            )
+
+            # Verify relative :write / :read resolved inside `work_dir`
+            self.assertEqual((work_dir / "rel_hello.txt").read_text(encoding="utf-8"), "你好交互模式🐾")
+            self.assertIn("你好交互模式🐾", rest)
+            self.assertIn("REPL_RAW_OK", rest)
+            self.assertIn("LOCAL_BANG_OK", rest)
+            self.assertIn("SWITCHED_TO_B", rest)
+
+            # Active target after REPL `:use nodeB` is persisted as nodeB
+            st_after = json.loads(run_cli(dir_a, ":nodes").stdout)
+            self.assertEqual(st_after["active"], "nodeB")
+
+    @unittest.skipIf(sys.platform.startswith("win"), "POSIX pty auto-REPL test")
+    def test_auto_tty_enters_repl_with_zero_args(self):
+        import pty
+        import select
+
+        with tempfile.TemporaryDirectory() as tmp:
+            master_fd, slave_fd = pty.openpty()
+            env = os.environ.copy()
+            env["REMOTE_MCP_STATE_DIR"] = str(Path(tmp) / "tty_state")
+            env["RMCP_STATE_DIR"] = str(Path(tmp) / "tty_state")
+            env["NO_COLOR"] = "1"
+            proc = subprocess.Popen(
+                [sys.executable, RMCP_SCRIPT],
+                stdin=slave_fd,
+                stdout=slave_fd,
+                stderr=slave_fd,
+                env=env,
+                close_fds=True,
+            )
+            os.close(slave_fd)
+            collected = bytearray()
+            sent_cmds = False
+            try:
+                deadline = time.time() + 10.0
+                while time.time() < deadline:
+                    rlist, _, _ = select.select([master_fd], [], [], 0.2)
+                    if rlist:
+                        try:
+                            chunk = os.read(master_fd, 4096)
+                        except OSError:
+                            break
+                        if not chunk:
+                            break
+                        collected.extend(chunk)
+                        txt = collected.decode("utf-8", errors="replace")
+                        if not sent_cmds and "]>" in txt:
+                            os.write(master_fd, b"echo PTY_AUTO_REPL_OK\n:q\n")
+                            sent_cmds = True
+                    if proc.poll() is not None and not rlist:
+                        break
+                proc.wait(timeout=5)
+            finally:
+                os.close(master_fd)
+                if proc.poll() is None:
+                    proc.kill()
+
+            full_txt = collected.decode("utf-8", errors="replace")
+            self.assertEqual(proc.returncode, 0, full_txt)
+            self.assertIn("interactive mode", full_txt)
+            self.assertIn("PTY_AUTO_REPL_OK", full_txt)
+
+
 if __name__ == "__main__":
     unittest.main()

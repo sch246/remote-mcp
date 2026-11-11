@@ -16,12 +16,12 @@
 
 Cross-platform (Linux & Windows) remote execution toolkit with two entrypoints:
 
-1. **`rmcp.py` (Zero-dependency single-file CLI + Multi-Hop Encrypted Mesh Router + Remote Node)** — built for one-shot bots (without interactive REPL support) and multi-hop networks:
-   - **Normal command pass-through**: any command not starting with `:` runs directly on the active remote node, preserving working directory (`cwd`) across invocations and propagating the exact exit code.
+1. **`rmcp.py` (Zero-dependency single-file CLI + Interactive REPL + Multi-Hop Encrypted Mesh Router + Remote Node)** — built for both one-shot bots and interactive human shells:
+   - **Normal command pass-through & Interactive REPL**: running `python rmcp.py` in a TTY (or `python rmcp.py :repl [target]` / `-i`) opens an interactive shell with persistent multi-hop pipe reuse, readline history, Tab completion, raw shell pipelines (`|`, `>`, `&&`), `!<local_cmd>`, and `:q` to exit; in non-TTY / one-shot invocations, any command not starting with `:` runs directly on the active remote node, preserving `cwd` and propagating exit codes.
    - **`:` management commands**: commands starting with `:` (Vim-style — literal across Bash, Zsh, Fish, Git Bash, `cmd.exe`, and PowerShell with zero path-expansion collisions) manage node connections, active target switching, multi-hop routing tables, file transfers, background processes, and boot autostart.
    - **Router-like multi-hop forwarding + anti-broadcast-storm**: each host has a deterministic `node_id`; edges are recorded passively on connection (no background polling), packets route via `local -> direct/reverse peers -> cached unicast route -> controlled flood discovery`, and broadcast storms are prevented via `pkt_id` deduplication, `ttl` hop decrement, and `via` split-horizon loop detection.
-   - **SSH preferred + self-bootstrap + encrypted HTTP listener + outbound reverse tunnel (`--dial`)**:
-     - Over SSH, Base64-framed envelopes stream over `ssh --stdio-hop` pipes — bypassing `bash`/`cmd.exe` multi-hop quoting issues and Windows GBK mojibake. `--bootstrap` automatically streams `rmcp.py` to `~/.rmcp/rmcp.py` on the target, and `--via <hop>` lets an intermediate jump host connect onward using **its own SSH keys or private network access**.
+   - **SSH preferred (persistent multiplexing) + self-bootstrap + encrypted HTTP listener + outbound reverse tunnel (`--dial`)**:
+     - Over SSH, Base64-framed envelopes stream over `ssh --stdio-hop` / `--stdio-loop` pipes (interactive REPL and multi-chunk file transfers keep multi-hop SSH pipes warm across commands, avoiding repeated SSH handshakes) — bypassing `bash`/`cmd.exe` multi-hop quoting issues and Windows GBK mojibake. `--bootstrap` automatically streams `rmcp.py` to `~/.rmcp/rmcp.py` on the target, and `--via <hop>` lets an intermediate jump host connect onward using **its own SSH keys or private network access**.
      - On SSH-less machines, `--listen` binds an HTTP port with token-derived authenticated encryption (`BLAKE2b-CTR + HMAC-SHA256`) while staying backward-compatible with legacy `agent.py` v0.4.
      - On NAT / inbound-blocked machines without SSH, `--dial <hub_url> --token <T>` establishes an outbound long-polling reverse tunnel to any listening hub node so the whole mesh can route into it.
      - Built-in `--watchdog` crash supervisor and `:autostart on` (silent user `Startup` `.vbs` on Windows requiring no admin rights; user `crontab @reboot` on Linux).
@@ -72,12 +72,19 @@ python rmcp.py python -c "print('clean multi-hop quotes & UTF-8!')"
 # One-shot override without changing active target
 python rmcp.py --to win6 hostname
 
-# Multi-hop file read/write/edit & SHA-256 verified streaming upload/download
-python rmcp.py :read D:/github/remote-mcp/README.md
+# Multi-hop file read/write/edit & SHA-256 verified streaming upload/download (relative remote cwd paths supported)
+python rmcp.py :read README.md
 python rmcp.py :write /tmp/hello.txt "hello mesh"
 python rmcp.py :edit /tmp/hello.txt hello hi
 python rmcp.py :upload ./build.zip D:/releases/build.zip
 python rmcp.py :download D:/logs/app.log ./app.log
+
+# Interactive REPL shell (keeps multi-hop SSH pipes warm across commands)
+python rmcp.py :repl nat-pc                   # or simply run `python rmcp.py` in a TTY / `python rmcp.py -i`
+# [nat-pc D:\github\remote-mcp]> git status -sb
+# [nat-pc D:\github\remote-mcp]> !ls -lh ./local_patch.diff   # !<cmd> runs locally without changing :use
+# [nat-pc D:\github\remote-mcp]> :use win6                    # switch active node live inside REPL
+# [win6 C:\Users\user]> :q
 ```
 
 ### 3. `:` Management Command Reference
@@ -85,6 +92,8 @@ python rmcp.py :download D:/logs/app.log ./app.log
 | Command | Purpose |
 |---|---|
 | `:help` | Show CLI usage and command reference |
+| `:repl [target]` (`:shell`, `-i`) | Enter interactive REPL (persistent multi-hop pipes, history, Tab completion, `:q` to exit) |
+| `:local <cmd>` (`!<cmd>` inside REPL) | Run a command on THIS local machine without changing active `:use` target |
 | `:id [--alias <name>]` | Show deterministic `node_id` and alias (or set local alias) |
 | `:nodes` (`:peers`, `:routes`) | Show local or remote node's peers, cached routes, and reverse sessions |
 | `:connect <alias> <endpoint> [--bootstrap] [--token T] [--via <hop>]` | Connect and record an SSH or HTTP peer edge |

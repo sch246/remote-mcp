@@ -13,12 +13,12 @@
 
 跨平台（Linux & Windows）远程执行工具集，提供两种入口：
 
-1. **`rmcp.py`（零依赖单文件 CLI + 多跳加密 Mesh 路由器 + 远端节点）** —— 专为不支持交互式 REPL 的普通 Bot 与多跳网络环境设计：
-   - **普通命令直穿**：不以 `:` 开头的命令直接发往当前激活的远端节点执行，跨调用自动保持远端工作目录（`cwd`）并透传退出码。
+1. **`rmcp.py`（零依赖单文件 CLI + 交互式 REPL + 多跳加密 Mesh 路由器 + 远端节点）** —— 同时兼顾单次调用 Bot 与人类交互终端：
+   - **普通命令直穿 & 交互式 REPL**：不带参数在终端运行 `python rmcp.py`（或显式 `python rmcp.py :repl [目标]` / `-i`）即可进入带命令历史、Tab 补全与持久长连接复用的交互式 Shell（支持管道 `|`、重定向 `>`、`!<本地命令>` 与 `:q` 退出）；非 TTY 环境下单次调用不带 `:` 的命令直接发往当前激活远端节点执行，跨调用保持远端工作目录（`cwd`）并透传退出码。
    - **`:` 管理命令**：以 `:` 开头（Vim 风格，在 Bash / Zsh / Fish / Git Bash / `cmd.exe` / PowerShell 下均原样透传、零路径展开冲突）执行节点连接、切换、多跳路由查看、文件传输、后台进程管理与自启动配置。
    - **路由器式多跳转发 + 防广播风暴**：每台机器拥有确定性 `node_id`；建连即被动记录拓扑边（不主动轮询探测），收包按「本机 → 直连/反向邻居 → 缓存单播路由 → 受控洪泛发现」转发，依靠 `pkt_id` 去重、`ttl` 跳数递减与 `via` 路径分裂视野彻底杜绝广播风暴。
-   - **SSH 优先 + 自举复制 + HTTP 加密监听 + 反向连接（`--dial`）**：
-     - 有 SSH 时走 `ssh --stdio-hop` 管道传输 Base64 帧，彻底绕过 `bash`/`cmd.exe` 多跳引号转义地狱与 GBK 乱码，支持 `--bootstrap` 自动把单文件 `rmcp.py` 流式部署到目标机 `~/.rmcp/rmcp.py`；跳板机还能用**自己的 SSH Key 或内网权限**连接下一跳（`--via <跳板>`）。
+   - **SSH 优先（持久多路复用）+ 自举复制 + HTTP 加密监听 + 反向连接（`--dial`）**：
+     - 有 SSH 时走 `ssh --stdio-hop` / `--stdio-loop` 管道传输 Base64 帧（交互模式与大文件分块传输自动保持全链路多跳 SSH 管道常驻热复用，免除重复握手耗时），彻底绕过 `bash`/`cmd.exe` 多跳引号转义地狱与 GBK 乱码；支持 `--bootstrap` 自动把单文件 `rmcp.py` 流式部署到目标机 `~/.rmcp/rmcp.py`；跳板机还能用**自己的 SSH Key 或内网权限**连接下一跳（`--via <跳板>`）。
      - 无 SSH 时可运行 `--listen` 监听端口并生成 token（`BLAKE2b-CTR + HMAC-SHA256` 认证加密），兼容旧版 `agent.py` v0.4。
      - 无公网 IP / 防火墙禁入站时可运行 `--dial <hub_url> --token <T>` 主动向外长轮询连入中枢节点，全网即可反向路由访问该内网节点。
      - 支持 `--watchdog` 崩溃自愈守护与 `:autostart on` 开机自启（Windows 写入用户 `Startup` 目录无窗口 `.vbs`，无需管理员权限；Linux 写入用户 `crontab @reboot`）。
@@ -69,12 +69,19 @@ python rmcp.py python -c "print('多跳引号和中文都不乱码喵')"
 # 临时向指定节点发单条命令（不改变当前 active）
 python rmcp.py --to win6 hostname
 
-# 跨任意多跳读写改文件与流式大文件传输（端到端 SHA-256 校验）
-python rmcp.py :read D:/github/remote-mcp/README.md
+# 跨任意多跳读写改文件与流式大文件传输（端到端 SHA-256 校验，支持相对远端 cwd 路径）
+python rmcp.py :read README.md
 python rmcp.py :write /tmp/hello.txt "hello mesh"
 python rmcp.py :edit /tmp/hello.txt hello hi
 python rmcp.py :upload ./build.zip D:/releases/build.zip
 python rmcp.py :download D:/logs/app.log ./app.log
+
+# 进入人类交互式 REPL 模式（多跳 SSH 管道自动保持常驻复用，毫秒级响应）
+python rmcp.py :repl nat-pc                   # 或在终端直接运行 python rmcp.py / python rmcp.py -i
+# [nat-pc D:\github\remote-mcp]> git status -sb | head -n 5
+# [nat-pc D:\github\remote-mcp]> !ls -lh ./local_patch.diff   # !<命令> 临时在本机执行
+# [nat-pc D:\github\remote-mcp]> :use win6                    # 会话内秒切其他节点
+# [win6 C:\Users\user]> :q
 ```
 
 ### 3. `:` 管理命令速查
@@ -82,6 +89,8 @@ python rmcp.py :download D:/logs/app.log ./app.log
 | 命令 | 作用 |
 |---|---|
 | `:help` | 显示完整命令帮助 |
+| `:repl [目标]`（或 `:shell` / `-i`） | 进入交互式 REPL（持久复用多跳管道、方向键历史、Tab 补全、`:q` 退出） |
+| `:local <命令>`（REPL 内可简写 `!<命令>`） | 不切换当前激活节点，直接在本机执行一条命令 |
 | `:id [--alias <名>]` | 查看本机确定性 `node_id` 与别名（可修改本机别名） |
 | `:nodes`（或 `:peers` / `:routes`） | 查看本机或指定节点的邻居表、缓存路由与反向在线会话 |
 | `:connect <别名> <地址> [--bootstrap] [--token T] [--via <跳板>]` | 建立 SSH 或 HTTP 边并记录拓扑 |
