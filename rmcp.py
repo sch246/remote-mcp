@@ -50,7 +50,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 IS_WINDOWS = sys.platform.startswith("win")
 HERE = Path(__file__).resolve().parent
 
@@ -179,15 +179,71 @@ def decrypt_obj(box: dict, secret: str, check_ts: bool = True) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Router State & Anti-Broadcast-Storm Deduplication
+# Router Topology, Caller-Origin Session Isolation & Anti-Storm Deduplication
 # ---------------------------------------------------------------------------
 
 _STATE_LOCK = threading.Lock()
 _MEM_SEEN: dict[str, float] = {}
+_SESSION_OVERRIDE: str = ""
+
+
+@contextlib.contextmanager
+def _cross_process_lock(lock_path: Path):
+    """Best-effort OS file lock (fcntl on POSIX, msvcrt on Windows) for shared JSON state."""
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+b") as lf:
+        locked = False
+        if not IS_WINDOWS:
+            with contextlib.suppress(Exception):
+                import fcntl
+
+                fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+                locked = True
+        else:
+            with contextlib.suppress(Exception):
+                import msvcrt
+
+                lf.seek(0)
+                if lf.tell() == 0:
+                    lf.write(b"0")
+                    lf.flush()
+                lf.seek(0)
+                msvcrt.locking(lf.fileno(), msvcrt.LK_LOCK, 1)
+                locked = True
+        try:
+            yield
+        finally:
+            if locked:
+                if not IS_WINDOWS:
+                    with contextlib.suppress(Exception):
+                        import fcntl
+
+                        fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+                else:
+                    with contextlib.suppress(Exception):
+                        import msvcrt
+
+                        lf.seek(0)
+                        msvcrt.locking(lf.fileno(), msvcrt.LK_UNLCK, 1)
+
+
+def _atomic_write_json(target: Path, obj: dict) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_suffix(f".tmp.{os.getpid()}.{threading.get_ident()}")
+    tmp.write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, target)
 
 
 def _router_file() -> Path:
     return get_state_dir() / "router.json"
+
+
+def _sessions_dir() -> Path:
+    return get_state_dir() / "sessions"
+
+
+def _procs_file() -> Path:
+    return get_state_dir() / "procs.json"
 
 
 def _legacy_hosts_file() -> Path:
@@ -201,21 +257,103 @@ def _seen_file() -> Path:
     return get_state_dir() / "seen_pkts.json"
 
 
-def load_router_state() -> dict:
+def _normalize_path_key(p: Path) -> str:
+    try:
+        s = str(p.resolve())
+    except Exception:
+        s = os.path.abspath(str(p))
+    if IS_WINDOWS and len(s) >= 2 and s[1] == ":":
+        s = s[0].upper() + s[1:]
+    return s
+
+
+def _find_project_root(start: Path) -> str:
+    """Walk upward from `start` to anchor caller identity at repo root (.rmcp-root/.git/.hg)."""
+    cur = Path(_normalize_path_key(start))
+    for candidate in (cur, *cur.parents):
+        for marker in (".rmcp-root", ".git", ".hg"):
+            with contextlib.suppress(Exception):
+                if (candidate / marker).exists():
+                    return _normalize_path_key(candidate)
+    return _normalize_path_key(cur)
+
+
+def _detect_caller_actor() -> tuple[str, bool]:
+    """Return `(actor_tag, is_explicit_session)`. Isolates co-located agents automatically."""
+    explicit = (_SESSION_OVERRIDE or os.environ.get("RMCP_SESSION") or "").strip()
+    if explicit:
+        return f"session:{explicit}", True
+    if not os.environ.get("RMCP_IGNORE_AGENT_ENV"):
+        for env_key, prefix in (
+            ("ANTIGRAVITY_CONVERSATION_ID", "agy"),
+            ("CODEX_THREAD_ID", "codex"),
+            ("CLAUDE_SESSION_ID", "claude"),
+        ):
+            val = (os.environ.get(env_key) or "").strip()
+            if val:
+                return f"{prefix}:{val[:12]}", False
+    return "", False
+
+
+def detect_caller_origin(node_id: str = "", alias: str = "") -> dict:
+    """Capture caller provenance `(node_id, host, root_dir, cwd, actor)` & deterministic `caller_key`."""
+    nid = node_id or compute_default_node_id()
+    host = alias or os.environ.get("REMOTE_MCP_NODE_ALIAS") or socket.gethostname()
+    try:
+        raw_cwd_p = Path.cwd()
+    except Exception:
+        raw_cwd_p = Path.home()
+    raw_cwd = _normalize_path_key(raw_cwd_p)
+    root_dir = _find_project_root(raw_cwd_p)
+    actor, is_explicit = _detect_caller_actor()
+    if is_explicit:
+        caller_key = f"{nid}@{actor}"
+    elif actor:
+        caller_key = f"{nid}:{root_dir}@{actor}"
+    else:
+        caller_key = f"{nid}:{root_dir}"
+    return {
+        "caller_key": caller_key,
+        "node_id": nid,
+        "host": host,
+        "root_dir": root_dir,
+        "cwd": raw_cwd,
+        "actor": actor,
+        "user": current_user(),
+    }
+
+
+def _format_origin_label(origin: dict | None) -> str:
+    if not isinstance(origin, dict) or not origin:
+        return ""
+    host = origin.get("host") or origin.get("node_id") or "unknown"
+    folder = origin.get("root_dir") or origin.get("cwd") or ""
+    actor = origin.get("actor") or ""
+    base = f"{host}:{folder}" if folder else str(host)
+    return f"{base}@{actor}" if actor else base
+
+
+def _session_file_for_key(caller_key: str) -> Path:
+    digest = hashlib.sha256(caller_key.encode("utf-8")).hexdigest()[:16]
+    return _sessions_dir() / f"{digest}.json"
+
+
+def load_topology_state() -> dict:
+    """Load machine-wide shared Mesh Topology (`node_id`, `alias`, `peers`, `routes`)."""
     rf = _router_file()
-    state: dict = {}
+    topo: dict = {}
     if rf.exists():
         with contextlib.suppress(Exception):
-            state = json.loads(rf.read_text(encoding="utf-8"))
-    if not isinstance(state, dict):
-        state = {}
+            topo = json.loads(rf.read_text(encoding="utf-8"))
+    if not isinstance(topo, dict):
+        topo = {}
 
-    state.setdefault("node_id", compute_default_node_id())
-    state.setdefault("alias", os.environ.get("REMOTE_MCP_NODE_ALIAS") or socket.gethostname())
-    state.setdefault("active", "")
-    state.setdefault("peers", {})
-    state.setdefault("routes", {})
-    state.setdefault("cwds", {})
+    topo.setdefault("node_id", compute_default_node_id())
+    topo.setdefault("alias", os.environ.get("REMOTE_MCP_NODE_ALIAS") or socket.gethostname())
+    topo.setdefault("default_active", topo.get("active", ""))
+    topo.setdefault("peers", {})
+    topo.setdefault("routes", {})
+    legacy_cwds: dict[str, str] = dict(topo.get("cwds") or {})
 
     # Auto-import HTTP hosts from legacy hosts.json (non-destructively)
     hf = _legacy_hosts_file()
@@ -223,8 +361,8 @@ def load_router_state() -> dict:
         with contextlib.suppress(Exception):
             legacy = json.loads(hf.read_text(encoding="utf-8"))
             for alias, h in (legacy.get("hosts") or {}).items():
-                if alias not in state["peers"] and isinstance(h, dict) and h.get("url"):
-                    state["peers"][alias] = {
+                if alias not in topo["peers"] and isinstance(h, dict) and h.get("url"):
+                    topo["peers"][alias] = {
                         "alias": alias,
                         "type": "http",
                         "url": h["url"],
@@ -232,19 +370,161 @@ def load_router_state() -> dict:
                         "platform": h.get("platform", ""),
                         "cwd": h.get("cwd", ""),
                     }
-                if h.get("cwd") and alias not in state["cwds"]:
-                    state["cwds"][alias] = h["cwd"]
-            if not state["active"] and legacy.get("active"):
-                state["active"] = legacy["active"]
-    return state
+                if isinstance(h, dict) and h.get("cwd") and alias not in legacy_cwds:
+                    legacy_cwds[alias] = h["cwd"]
+            if not topo["default_active"] and legacy.get("active"):
+                topo["default_active"] = legacy["active"]
+
+    for alias, p in (topo.get("peers") or {}).items():
+        if isinstance(p, dict) and p.get("cwd") and alias not in legacy_cwds:
+            legacy_cwds[alias] = p["cwd"]
+    topo["_default_cwds"] = legacy_cwds
+    return topo
+
+
+def save_topology_state(state: dict) -> None:
+    """Atomically save ONLY shared topology fields to `router.json` under cross-process lock."""
+    with _cross_process_lock(get_state_dir() / "router.lock"):
+        rf = _router_file()
+        existing: dict = {}
+        if rf.exists():
+            with contextlib.suppress(Exception):
+                raw = json.loads(rf.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    existing = raw
+        out = {
+            "node_id": state.get("node_id") or existing.get("node_id") or compute_default_node_id(),
+            "alias": state.get("alias") or existing.get("alias") or socket.gethostname(),
+            "default_active": (
+                state["default_active"]
+                if "default_active" in state
+                else existing.get("default_active", existing.get("active", ""))
+            ),
+            "peers": state.get("peers") if "peers" in state else existing.get("peers", {}),
+            "routes": state.get("routes") if "routes" in state else existing.get("routes", {}),
+        }
+        _atomic_write_json(rf, out)
+
+
+def load_caller_session(topo: dict | None = None) -> dict:
+    t = topo or load_topology_state()
+    origin = detect_caller_origin(node_id=t["node_id"], alias=t["alias"])
+    sf = _session_file_for_key(origin["caller_key"])
+    sess: dict = {}
+    if sf.exists():
+        with contextlib.suppress(Exception):
+            raw = json.loads(sf.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                sess = raw
+    return {
+        "caller_key": origin["caller_key"],
+        "caller": _format_origin_label(origin),
+        "origin": origin,
+        "active": sess.get("active", ""),
+        "cwds": dict(sess.get("cwds") or {}),
+        "updated_at": sess.get("updated_at", 0),
+    }
+
+
+def update_caller_session(
+    *,
+    active: str | None = None,
+    cwd_updates: dict[str, str] | None = None,
+) -> dict:
+    """Atomically update ONLY this caller's `sessions/<hash>.json` without touching other callers."""
+    topo = load_topology_state()
+    origin = detect_caller_origin(node_id=topo["node_id"], alias=topo["alias"])
+    sf = _session_file_for_key(origin["caller_key"])
+    with _STATE_LOCK, _cross_process_lock(sf.with_suffix(".lock")):
+        cur: dict = {}
+        if sf.exists():
+            with contextlib.suppress(Exception):
+                raw = json.loads(sf.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    cur = raw
+        cwds = dict(cur.get("cwds") or {})
+        if cwd_updates:
+            for k, v in cwd_updates.items():
+                if k and v:
+                    cwds[k] = v
+        new_active = cur.get("active", "") if active is None else active
+        doc = {
+            "caller_key": origin["caller_key"],
+            "caller": _format_origin_label(origin),
+            "origin": origin,
+            "active": new_active,
+            "cwds": cwds,
+            "updated_at": int(time.time()),
+        }
+        _atomic_write_json(sf, doc)
+        return doc
+
+
+def list_caller_sessions(current_key: str = "") -> list[dict]:
+    sdir = _sessions_dir()
+    if not sdir.exists():
+        return []
+    items: list[dict] = []
+    for p in sdir.glob("*.json"):
+        with contextlib.suppress(Exception):
+            raw = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(raw, dict) and raw.get("caller_key"):
+                items.append(
+                    {
+                        "caller_key": raw["caller_key"],
+                        "caller": raw.get("caller") or _format_origin_label(raw.get("origin")),
+                        "active": raw.get("active") or "",
+                        "cwds": raw.get("cwds") or {},
+                        "updated_at": raw.get("updated_at", 0),
+                        "current": raw["caller_key"] == current_key,
+                        "file": p.name,
+                    }
+                )
+    items.sort(key=lambda x: (not x.get("current", False), -int(x.get("updated_at") or 0)))
+    return items
+
+
+def clear_caller_sessions(only_key: str = "") -> int:
+    sdir = _sessions_dir()
+    if not sdir.exists():
+        return 0
+    removed = 0
+    for p in list(sdir.glob("*.json")):
+        with contextlib.suppress(Exception):
+            if only_key:
+                raw = json.loads(p.read_text(encoding="utf-8"))
+                if not isinstance(raw, dict) or raw.get("caller_key") != only_key:
+                    continue
+            p.unlink(missing_ok=True)
+            p.with_suffix(".lock").unlink(missing_ok=True)
+            removed += 1
+    return removed
+
+
+def load_router_state() -> dict:
+    """Return merged view: shared topology (`peers`/`routes`) + isolated caller session (`active`/`cwds`)."""
+    topo = load_topology_state()
+    sess = load_caller_session(topo)
+    merged_cwds = dict(topo.get("_default_cwds") or {})
+    merged_cwds.update(sess.get("cwds") or {})
+    effective_active = sess.get("active") or topo.get("default_active") or ""
+    return {
+        "node_id": topo["node_id"],
+        "alias": topo["alias"],
+        "default_active": topo.get("default_active", ""),
+        "peers": topo["peers"],
+        "routes": topo["routes"],
+        "active": effective_active,
+        "cwds": merged_cwds,
+        "caller_key": sess["caller_key"],
+        "caller": sess["caller"],
+        "origin": sess["origin"],
+    }
 
 
 def save_router_state(state: dict) -> None:
-    rf = _router_file()
-    rf.parent.mkdir(parents=True, exist_ok=True)
-    tmp = rf.with_suffix(f".tmp.{os.getpid()}.{threading.get_ident()}")
-    tmp.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
-    os.replace(tmp, rf)
+    """Backward-compatible helper saving shared topology fields to `router.json`."""
+    save_topology_state(state)
 
 
 def mark_packet_seen(pkt_id: str) -> bool:
@@ -278,14 +558,12 @@ def mark_packet_seen(pkt_id: str) -> bool:
             oldest = sorted(disk_seen.items(), key=lambda kv: kv[1])[-256:]
             disk_seen = dict(oldest)
         with contextlib.suppress(Exception):
-            tmp = sf.with_suffix(f".tmp.{os.getpid()}.{threading.get_ident()}")
-            tmp.write_text(json.dumps(disk_seen), encoding="utf-8")
-            os.replace(tmp, sf)
+            _atomic_write_json(sf, disk_seen)
         return False
 
 
 # ---------------------------------------------------------------------------
-# Background Process Registry & Auto-start Management
+# Background Process Registry (Persisted + Origin-Tagged) & Auto-start
 # ---------------------------------------------------------------------------
 
 _PROCS: dict[int, dict] = {}
@@ -296,6 +574,57 @@ def _proc_status(rec: dict) -> str:
     proc: subprocess.Popen = rec["_proc"]
     code = proc.poll()
     return "running" if code is None else f"exited:{code}"
+
+
+def _is_pid_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if IS_WINDOWS:
+        try:
+            import ctypes
+
+            k32 = ctypes.windll.kernel32
+            handle = k32.OpenProcess(0x1000, False, int(pid))  # PROCESS_QUERY_LIMITED_INFORMATION
+            if not handle:
+                return False
+            try:
+                exit_code = ctypes.c_ulong(0)
+                if not k32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                    return False
+                return int(exit_code.value) == 259  # STILL_ACTIVE
+            finally:
+                k32.CloseHandle(handle)
+        except Exception:
+            return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    with contextlib.suppress(Exception):
+        stat_txt = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        rparen = stat_txt.rfind(")")
+        if rparen != -1 and stat_txt[rparen + 2 : rparen + 3] == "Z":
+            return False
+    return True
+
+
+def _load_persisted_procs() -> dict[str, dict]:
+    pf = _procs_file()
+    if not pf.exists():
+        return {}
+    with contextlib.suppress(Exception):
+        raw = json.loads(pf.read_text(encoding="utf-8"))
+        if isinstance(raw, dict):
+            return raw
+    return {}
+
+
+def _save_persisted_procs(procs_map: dict[str, dict]) -> None:
+    _atomic_write_json(_procs_file(), procs_map)
 
 
 def _windows_startup_vbs_path() -> Path:
@@ -590,12 +919,13 @@ def _resolve_remote_path(raw_path: str, cwd: str | None = None) -> Path:
     return p
 
 
-def execute_local_action(action: str, params: dict) -> dict:
+def execute_local_action(action: str, params: dict, origin: dict | None = None) -> dict:
     """Execute a router envelope action on THIS machine."""
-    state = load_router_state()
+    state = load_topology_state()
+    caller_label = _format_origin_label(origin)
 
     if action == "ping":
-        return {
+        out = {
             "ok": True,
             "version": VERSION,
             "node_id": state["node_id"],
@@ -607,6 +937,9 @@ def execute_local_action(action: str, params: dict) -> dict:
             "platform": sys.platform,
             "is_windows": IS_WINDOWS,
         }
+        if caller_label:
+            out["caller"] = caller_label
+        return out
 
     if action == "env":
         return _collect_env_snapshot()
@@ -640,7 +973,7 @@ def execute_local_action(action: str, params: dict) -> dict:
         p = _resolve_remote_path(params["path"], params.get("cwd"))
         data = base64.b64decode(params.get("data_b64", ""))
         p.parent.mkdir(parents=True, exist_ok=True)
-        part = p.with_suffix(p.suffix + f".part.{os.getpid()}")
+        part = p.with_suffix(p.suffix + f".part.{os.getpid()}.{threading.get_ident()}")
         part.write_bytes(data)
         os.replace(part, p)
         return {"ok": True, "path": str(p), "bytes": len(data)}
@@ -658,14 +991,18 @@ def execute_local_action(action: str, params: dict) -> dict:
         if count > 1:
             raise ValueError(f"old_text matched {count} times in {p} — must be unique")
         updated = text.replace(old_text, new_text, 1).encode("utf-8")
-        part = p.with_suffix(p.suffix + f".part.{os.getpid()}")
+        part = p.with_suffix(p.suffix + f".part.{os.getpid()}.{threading.get_ident()}")
         part.write_bytes(updated)
         os.replace(part, p)
         return {"ok": True, "path": str(p), "bytes": len(updated)}
 
     if action == "upload_chunk":
         p = _resolve_remote_path(params["path"], params.get("cwd"))
-        part = p.with_suffix(p.suffix + ".rmcp_part")
+        upload_tag = str(params.get("upload_id") or "").strip()
+        if not upload_tag and caller_label:
+            upload_tag = hashlib.sha256(caller_label.encode("utf-8")).hexdigest()[:10]
+        part_suffix = f".rmcp_part.{upload_tag}" if upload_tag else ".rmcp_part"
+        part = p.with_suffix(p.suffix + part_suffix)
         offset = int(params.get("offset", 0))
         chunk = base64.b64decode(params.get("data_b64", ""))
         finalize = bool(params.get("finalize", False))
@@ -674,7 +1011,7 @@ def execute_local_action(action: str, params: dict) -> dict:
         p.parent.mkdir(parents=True, exist_ok=True)
         mode = "wb" if offset == 0 else "r+b"
         if offset > 0 and not part.exists():
-            raise ValueError(f"missing .rmcp_part for offset {offset}")
+            raise ValueError(f"missing {part_suffix} for offset {offset}")
         with part.open(mode) as f:
             f.seek(offset)
             f.write(chunk)
@@ -725,9 +1062,13 @@ def execute_local_action(action: str, params: dict) -> dict:
         cmd = params.get("command")
         argv = params.get("argv")
         cwd = params.get("cwd") or str(Path.cwd())
-        stdout_path = params.get("stdout")
-        stderr_path = params.get("stderr")
+        stdout_path = str(_resolve_remote_path(params["stdout"], cwd)) if params.get("stdout") else None
+        stderr_path = str(_resolve_remote_path(params["stderr"], cwd)) if params.get("stderr") else None
         use_shell = bool(params.get("shell", True))
+        if stdout_path:
+            Path(stdout_path).parent.mkdir(parents=True, exist_ok=True)
+        if stderr_path:
+            Path(stderr_path).parent.mkdir(parents=True, exist_ok=True)
         out_f = open(stdout_path, "ab", buffering=0) if stdout_path else None  # noqa: SIM115
         err_f = (
             open(stderr_path, "ab", buffering=0)  # noqa: SIM115
@@ -740,73 +1081,141 @@ def execute_local_action(action: str, params: dict) -> dict:
             "stderr": err_f or subprocess.DEVNULL,
             "stdin": subprocess.DEVNULL,
         }
-        if not IS_WINDOWS:
+        if IS_WINDOWS:
+            kwargs["creationflags"] = (
+                getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+                | getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+            )
+        else:
             kwargs["start_new_session"] = True
         proc = subprocess.Popen(cmd if use_shell else argv, shell=use_shell, **kwargs)
-        info = {
+        info: dict = {
             "pid": proc.pid,
             "command": cmd if use_shell else argv,
             "cwd": cwd,
             "stdout": stdout_path,
             "stderr": stderr_path,
             "started_at": time.time(),
+            "caller": caller_label,
         }
-        with _PROCS_LOCK:
+        if isinstance(origin, dict) and origin:
+            info["origin"] = origin
+        with _PROCS_LOCK, _cross_process_lock(_procs_file().with_suffix(".lock")):
             _PROCS[proc.pid] = {**info, "_proc": proc, "_out": out_f, "_err": err_f}
+            disk_procs = _load_persisted_procs()
+            disk_procs[str(proc.pid)] = info
+            _save_persisted_procs(disk_procs)
         return info
 
     if action == "list":
-        with _PROCS_LOCK:
+        with _PROCS_LOCK, _cross_process_lock(_procs_file().with_suffix(".lock")):
+            disk_procs = _load_persisted_procs()
             items = []
-            done = []
+            done_mem: list[int] = []
+            dirty_disk = False
+            seen_pids: set[int] = set()
+
             for pid, rec in _PROCS.items():
+                seen_pids.add(pid)
                 st = _proc_status(rec)
-                items.append(
-                    {
-                        "pid": pid,
-                        "command": rec["command"],
-                        "cwd": rec["cwd"],
-                        "stdout": rec["stdout"],
-                        "status": st,
-                    }
-                )
+                entry = {
+                    "pid": pid,
+                    "command": rec["command"],
+                    "cwd": rec["cwd"],
+                    "stdout": rec["stdout"],
+                    "status": st,
+                    "caller": rec.get("caller", ""),
+                }
+                if rec.get("origin"):
+                    entry["origin"] = rec["origin"]
+                items.append(entry)
                 if st != "running":
-                    done.append(pid)
-            for pid in done:
+                    done_mem.append(pid)
+                    if disk_procs.pop(str(pid), None) is not None:
+                        dirty_disk = True
+
+            for pid_s, drec in list(disk_procs.items()):
+                try:
+                    pid = int(pid_s)
+                except ValueError:
+                    disk_procs.pop(pid_s, None)
+                    dirty_disk = True
+                    continue
+                if pid in seen_pids:
+                    continue
+                alive = _is_pid_running(pid)
+                st = "running" if alive else "exited"
+                entry = {
+                    "pid": pid,
+                    "command": drec.get("command"),
+                    "cwd": drec.get("cwd"),
+                    "stdout": drec.get("stdout"),
+                    "status": st,
+                    "caller": drec.get("caller", ""),
+                }
+                if drec.get("origin"):
+                    entry["origin"] = drec["origin"]
+                items.append(entry)
+                if not alive:
+                    disk_procs.pop(pid_s, None)
+                    dirty_disk = True
+
+            for pid in done_mem:
                 rec = _PROCS.pop(pid, None)
                 if rec:
                     for f in {rec.get("_out"), rec.get("_err")}:
                         if f and not f.closed:
                             with contextlib.suppress(Exception):
                                 f.close()
+            if dirty_disk:
+                _save_persisted_procs(disk_procs)
         return {"processes": items}
 
     if action == "kill":
         pid = int(params["pid"])
         sig_name = str(params.get("signal", "TERM")).upper()
-        with _PROCS_LOCK:
+        with _PROCS_LOCK, _cross_process_lock(_procs_file().with_suffix(".lock")):
             rec = _PROCS.get(pid)
-        if not rec:
-            raise ValueError(f"pid {pid} not tracked by this node")
-        proc = rec["_proc"]
-        if proc.poll() is None:
-            if IS_WINDOWS:
-                subprocess.run(
-                    ["taskkill", "/F", "/T", "/PID", str(pid)],
-                    capture_output=True,
-                    timeout=10,
-                    check=False,
-                )
-                with contextlib.suppress(Exception):
-                    proc.kill()
-            else:
-                sig = signal.SIGKILL if sig_name == "KILL" else signal.SIGTERM
-                with contextlib.suppress(Exception):
-                    os.killpg(pid, sig)
-                with contextlib.suppress(Exception):
-                    proc.send_signal(sig)
-            with contextlib.suppress(Exception):
-                proc.wait(timeout=3)
+            disk_procs = _load_persisted_procs()
+            drec = disk_procs.get(str(pid))
+            if not rec and not drec:
+                raise ValueError(f"pid {pid} not tracked by this node")
+            if rec is not None:
+                proc = rec["_proc"]
+                if proc.poll() is None:
+                    if IS_WINDOWS:
+                        subprocess.run(
+                            ["taskkill", "/F", "/T", "/PID", str(pid)],
+                            capture_output=True,
+                            timeout=10,
+                            check=False,
+                        )
+                        with contextlib.suppress(Exception):
+                            proc.kill()
+                    else:
+                        sig = signal.SIGKILL if sig_name == "KILL" else signal.SIGTERM
+                        with contextlib.suppress(Exception):
+                            os.killpg(pid, sig)
+                        with contextlib.suppress(Exception):
+                            proc.send_signal(sig)
+                    with contextlib.suppress(Exception):
+                        proc.wait(timeout=3)
+            elif _is_pid_running(pid):
+                if IS_WINDOWS:
+                    subprocess.run(
+                        ["taskkill", "/F", "/T", "/PID", str(pid)],
+                        capture_output=True,
+                        timeout=10,
+                        check=False,
+                    )
+                else:
+                    sig = signal.SIGKILL if sig_name == "KILL" else signal.SIGTERM
+                    with contextlib.suppress(Exception):
+                        os.killpg(pid, sig)
+                    with contextlib.suppress(Exception):
+                        os.kill(pid, sig)
+            if disk_procs.pop(str(pid), None) is not None:
+                _save_persisted_procs(disk_procs)
         return {"pid": pid, "action": "signal-sent", "signal": sig_name}
 
     if action == "autostart":
@@ -833,18 +1242,18 @@ def execute_local_action(action: str, params: dict) -> dict:
     if action == "peer_remove":
         alias = str(params["alias"])
         with _STATE_LOCK:
-            st = load_router_state()
+            st = load_topology_state()
             removed = st["peers"].pop(alias, None)
             st["routes"] = {
                 k: v for k, v in st["routes"].items() if k != alias and v.get("next_hop") != alias
             }
-            if st.get("active") == alias:
-                st["active"] = next(iter(st["peers"].keys()), "")
-            save_router_state(st)
+            if st.get("default_active") == alias:
+                st["default_active"] = next(iter(st["peers"].keys()), "")
+            save_topology_state(st)
         return {"ok": True, "alias": alias, "removed": removed is not None}
 
     if action == "peers_list":
-        st = load_router_state()
+        st = load_topology_state()
         return {
             "node_id": st["node_id"],
             "alias": st["alias"],
@@ -999,11 +1408,15 @@ def bootstrap_ssh_target(
 
     # Probe remote python executable (works on both Windows cmd.exe and POSIX sh)
     probe_py = None
+    last_ssh_err = ""
     for candidate in ("python3", "python", "py -3"):
         probe_cmd = _ssh_base_cmd(target, ssh_port) + [
             f'{candidate} -c "import sys; print(\'RMCP_PY:\' + sys.executable)"'
         ]
-        res = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=20, check=False)
+        try:
+            res = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=15, check=False)
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(f"SSH connection timed out reaching '{target}'") from exc
         if res.returncode == 0 and "RMCP_PY:" in res.stdout:
             for ln in res.stdout.splitlines():
                 if "RMCP_PY:" in ln:
@@ -1011,9 +1424,16 @@ def bootstrap_ssh_target(
                     break
             if probe_py:
                 break
+        if res.returncode == 255:
+            err_detail = (res.stderr or res.stdout).strip()[:240]
+            raise RuntimeError(f"SSH unreachable for '{target}': {err_detail or 'exit 255'}")
+        last_ssh_err = (res.stderr or res.stdout).strip()[:200]
 
     if not probe_py:
-        raise RuntimeError(f"no working Python 3 found on SSH target '{target}'")
+        raise RuntimeError(
+            f"no working Python 3 found on SSH target '{target}'"
+            + (f" ({last_ssh_err})" if last_ssh_err else "")
+        )
 
     # Stream rmcp.py bytes via stdin into remote ~/.rmcp/rmcp.py (zero nested double-quotes or backslashes!)
     rpath_b64 = base64.b64encode(remote_path.encode("utf-8")).decode("ascii")
@@ -1285,6 +1705,10 @@ def send_via_ssh(peer: dict, env: dict, timeout: float = 120.0) -> dict:
             "REMOTE_MCP_STATE_DIR": peer_state_dir,
             "RMCP_STATE_DIR": peer_state_dir,
             "REMOTE_MCP_NODE_ALIAS": peer.get("alias", ""),
+            "RMCP_SESSION": "",
+            "ANTIGRAVITY_CONVERSATION_ID": "",
+            "CODEX_THREAD_ID": "",
+            "CLAUDE_SESSION_ID": "",
         }
         return _send_persistent_or_oneshot_stdio(
             peer_key=f"local:{peer_state_dir}:{script}",
@@ -1461,7 +1885,9 @@ def send_via_http(peer: dict, env: dict, timeout: float = 120.0) -> dict:
     # Encrypt sensitive inner body over HTTP when token is configured
     wire_env = dict(env)
     if tok and "enc" not in wire_env:
-        inner = {"action": wire_env.pop("action"), "params": wire_env.pop("params", {})}
+        inner: dict = {"action": wire_env.pop("action"), "params": wire_env.pop("params", {})}
+        if "origin" in wire_env:
+            inner["origin"] = wire_env.pop("origin")
         wire_env["enc"] = encrypt_obj(inner, tok)
 
     code, res = _http_request_json(base + "/route", "POST", tok, wire_env, timeout=timeout)
@@ -1525,7 +1951,7 @@ def _learn_route(dst: str, next_hop_alias: str, resp: dict) -> None:
         return
     plat = resp.get("platform") or (resp.get("result") or {}).get("platform") or ""
     with _STATE_LOCK:
-        state = load_router_state()
+        state = load_topology_state()
         if dst in state["peers"]:
             return
         prev_plat = (state["routes"].get(dst) or {}).get("platform", "")
@@ -1536,7 +1962,7 @@ def _learn_route(dst: str, next_hop_alias: str, resp: dict) -> None:
             "platform": plat or prev_plat,
             "updated_at": int(time.time()),
         }
-        save_router_state(state)
+        save_topology_state(state)
 
 
 def route_envelope(env: dict, timeout: float = 120.0) -> dict:
@@ -1545,7 +1971,7 @@ def route_envelope(env: dict, timeout: float = 120.0) -> dict:
     if mark_packet_seen(pkt_id):
         return {"ok": False, "error": "duplicate_packet_dropped", "loop": True}
 
-    state = load_router_state()
+    state = load_topology_state()
     my_id = state["node_id"]
     my_alias = state["alias"]
     dst = str(env.get("dst") or "self")
@@ -1558,8 +1984,9 @@ def route_envelope(env: dict, timeout: float = 120.0) -> dict:
     if _is_local_target(dst, state):
         action = str(env.get("action") or "ping")
         params = env.get("params") or {}
+        origin = env.get("origin") if isinstance(env.get("origin"), dict) else None
         try:
-            result = execute_local_action(action, params)
+            result = execute_local_action(action, params, origin=origin)
             return {
                 "ok": True,
                 "reached_dst": True,
@@ -1618,9 +2045,9 @@ def route_envelope(env: dict, timeout: float = 120.0) -> dict:
                 return resp
             # Otherwise route is stale; evict and fall through to discovery flood
             with _STATE_LOCK:
-                st2 = load_router_state()
+                st2 = load_topology_state()
                 st2["routes"].pop(dst, None)
-                save_router_state(st2)
+                save_topology_state(st2)
         else:
             rev_nh = _find_reverse_session(nh)
             if rev_nh is not None and nh not in via:
@@ -1667,6 +2094,7 @@ def send_action(dst: str, action: str, params: dict | None = None, timeout: floa
         "src": state["node_id"],
         "dst": dst or "self",
         "via": [],
+        "origin": state["origin"],
         "action": action,
         "params": params or {},
     }
@@ -1793,13 +2221,11 @@ def connect_peer_local(
         )
 
     with _STATE_LOCK:
-        state = load_router_state()
-        state["peers"][alias] = peer_entry
-        if peer_entry.get("cwd") and alias not in state["cwds"]:
-            state["cwds"][alias] = peer_entry["cwd"]
-        if not state.get("active"):
-            state["active"] = alias
-        save_router_state(state)
+        topo = load_topology_state()
+        topo["peers"][alias] = peer_entry
+        if not topo.get("default_active"):
+            topo["default_active"] = alias
+        save_topology_state(topo)
 
     return {k: v for k, v in peer_entry.items() if k != "token"}
 
@@ -1902,6 +2328,8 @@ class NodeHTTPHandler(BaseHTTPRequestHandler):
                     inner = decrypt_obj(env.pop("enc"), self.daemon_token)
                     env["action"] = inner["action"]
                     env["params"] = inner.get("params") or {}
+                    if "origin" in inner:
+                        env["origin"] = inner["origin"]
                 resp = route_envelope(env)
                 if was_encrypted:
                     outer = {k: v for k, v in resp.items() if k not in ("result", "error")}
@@ -2162,6 +2590,7 @@ _MGMT_COMMANDS = {
     "exit",
     "id",
     "whoami",
+    "sessions",
     "nodes",
     "hosts",
     "peers",
@@ -2278,6 +2707,7 @@ def _cli_upload(
     expected_sha = h.hexdigest()
 
     offset = 0
+    upload_id = secrets.token_hex(6)
     with persistent_stdio_context(), src.open("rb") as f:
         while True:
             chunk = f.read(STREAM_CHUNK)
@@ -2288,6 +2718,7 @@ def _cli_upload(
                 {
                     "path": remote_path,
                     "cwd": cwd,
+                    "upload_id": upload_id,
                     "offset": offset,
                     "data_b64": base64.b64encode(chunk).decode("ascii"),
                     "finalize": eof,
@@ -2375,12 +2806,14 @@ Usage:
   rmcp -i | :repl [target]                Start interactive shell with persistent multi-hop pipes
   rmcp <command...>                       Run shell command on active remote node (cwd preserved)
   rmcp --to <node> <command...>           Run one-shot command on <node> without switching active
+  rmcp --session <name> <command...>      Pin an explicit caller session scope (overrides auto-scope)
   rmcp :<mgmt-cmd> [args...]              Execute rmcp mesh/node management command
 
 Mesh & Routing Commands:
   :repl | :shell [target]                 Enter interactive REPL (inside REPL: :q / exit, !<cmd>)
   :local <command...>                     Run a command on THIS local machine without switching :use
-  :id                                     Show this machine's deterministic node_id & alias
+  :id                                     Show node_id, alias, and current caller origin/session
+  :sessions [--clear|--clear-all]         List (or clear) isolated per-caller sessions on this host
   :nodes | :peers | :routes [target]      Show local (or remote node's) known peers & cached routes
   :connect <alias> <endpoint> [options]   Connect & record a peer edge (SSH preferred, HTTP fallback)
       Endpoints:  ssh://user@host[:port]  |  user@host  |  http://host:port
@@ -2465,10 +2898,7 @@ def _exec_remote_shell(
     res = resp.get("result") or {}
     new_cwd = res.get("cwd")
     if persist_cwd and new_cwd and new_cwd != cur_cwd:
-        with _STATE_LOCK:
-            st = load_router_state()
-            st["cwds"][target] = new_cwd
-            save_router_state(st)
+        update_caller_session(cwd_updates={target: new_cwd})
 
     out_s = res.get("stdout") or ""
     err_s = res.get("stderr") or ""
@@ -2514,9 +2944,9 @@ def _handle_mgmt_command(cmd: str, args: list[str], explicit_to: str = "") -> in
     if cmd in ("id", "whoami"):
         if args and args[0] == "--alias" and len(args) >= 2:
             with _STATE_LOCK:
-                st = load_router_state()
-                st["alias"] = args[1]
-                save_router_state(st)
+                topo = load_topology_state()
+                topo["alias"] = args[1]
+                save_topology_state(topo)
             state = load_router_state()
         print(
             json.dumps(
@@ -2524,8 +2954,40 @@ def _handle_mgmt_command(cmd: str, args: list[str], explicit_to: str = "") -> in
                     "node_id": state["node_id"],
                     "alias": state["alias"],
                     "hostname": socket.gethostname(),
-                    "active": state.get("active") or "self",
+                    "caller": state["caller"],
+                    "caller_key": state["caller_key"],
+                    "active": _resolve_active_target("", state),
                     "state_dir": str(get_state_dir()),
+                },
+                indent=2,
+                ensure_ascii=False,
+            )
+        )
+        return 0
+
+    if cmd == "sessions":
+        clear_cur, _, args = _pop_flag(args, "--clear", False)
+        clear_all, _, args = _pop_flag(args, "--clear-all", False)
+        if clear_all:
+            n = clear_caller_sessions()
+            print(json.dumps({"ok": True, "cleared": n, "scope": "all"}, indent=2, ensure_ascii=False))
+            return 0
+        if clear_cur:
+            n = clear_caller_sessions(only_key=state["caller_key"])
+            print(
+                json.dumps(
+                    {"ok": True, "cleared": n, "caller_key": state["caller_key"]},
+                    indent=2,
+                    ensure_ascii=False,
+                )
+            )
+            return 0
+        print(
+            json.dumps(
+                {
+                    "current_caller": state["caller"],
+                    "current_caller_key": state["caller_key"],
+                    "sessions": list_caller_sessions(current_key=state["caller_key"]),
                 },
                 indent=2,
                 ensure_ascii=False,
@@ -2545,6 +3007,8 @@ def _handle_mgmt_command(cmd: str, args: list[str], explicit_to: str = "") -> in
         summary = {
             "node_id": state["node_id"],
             "alias": state["alias"],
+            "caller": state["caller"],
+            "caller_key": state["caller_key"],
             "active": _resolve_active_target("", state),
             "peers": {
                 k: {pk: pv for pk, pv in v.items() if pk != "token"}
@@ -2587,21 +3051,25 @@ def _handle_mgmt_command(cmd: str, args: list[str], explicit_to: str = "") -> in
                 sys.stderr.write(f"[rmcp] remote :connect via '{hop}' failed: {resp.get('error')}\n")
                 return 1
             info = resp.get("result") or {}
-            # Cache route locally so `rmcp :use <alias>` or `rmcp --to <alias>` works immediately!
+            # Cache route in shared topology & switch ONLY this caller's active session!
             first_hop = hop if hop in state["peers"] else (state["routes"].get(hop, {}).get("next_hop") or hop)
             with _STATE_LOCK:
-                st = load_router_state()
-                if first_hop in st["peers"]:
-                    st["routes"][alias] = {
+                topo = load_topology_state()
+                if first_hop in topo["peers"]:
+                    topo["routes"][alias] = {
                         "next_hop": first_hop,
                         "path": (resp.get("via") or [hop]) + [alias],
                         "node_id": info.get("node_id", ""),
+                        "platform": info.get("platform", ""),
                         "updated_at": int(time.time()),
                     }
-                if info.get("cwd"):
-                    st["cwds"][alias] = info["cwd"]
-                st["active"] = alias
-                save_router_state(st)
+                if not topo.get("default_active"):
+                    topo["default_active"] = alias
+                save_topology_state(topo)
+            update_caller_session(
+                active=alias,
+                cwd_updates={alias: info["cwd"]} if info.get("cwd") else None,
+            )
             print(json.dumps({"ok": True, "via": resp.get("via"), "peer": info}, indent=2, ensure_ascii=False))
             return 0
 
@@ -2614,10 +3082,10 @@ def _handle_mgmt_command(cmd: str, args: list[str], explicit_to: str = "") -> in
                 remote_path=rpath,
                 ssh_port=ssh_port,
             )
-            with _STATE_LOCK:
-                st = load_router_state()
-                st["active"] = alias
-                save_router_state(st)
+            update_caller_session(
+                active=alias,
+                cwd_updates={alias: info["cwd"]} if info.get("cwd") else None,
+            )
             print(json.dumps({"ok": True, "active": alias, "peer": info}, indent=2, ensure_ascii=False))
             return 0
         except Exception as e:
@@ -2645,31 +3113,27 @@ def _handle_mgmt_command(cmd: str, args: list[str], explicit_to: str = "") -> in
     if cmd in ("use", "to"):
         if not args:
             cur = _resolve_active_target("", state)
-            print(f"[rmcp] active target: {cur} (cwd: {state.get('cwds', {}).get(cur, '(default)')})")
+            print(
+                f"[rmcp] active target: {cur} "
+                f"(cwd: {state.get('cwds', {}).get(cur, '(default)')}, caller: {state['caller']})"
+            )
             return 0
         target = args[0]
         if _is_local_target(target, state):
-            with _STATE_LOCK:
-                st = load_router_state()
-                st["active"] = "self"
-                save_router_state(st)
-            print(f"[rmcp] switched active target -> self ({state['node_id']})")
+            update_caller_session(active="self")
+            print(f"[rmcp] switched active target -> self ({state['node_id']}, caller={state['caller']})")
             return 0
         resp = send_action(target, "ping", {}, timeout=30.0)
         if not resp.get("ok"):
             sys.stderr.write(f"[rmcp] cannot reach '{target}': {resp.get('error')}\n")
             return 1
         info = resp.get("result") or {}
-        with _STATE_LOCK:
-            st = load_router_state()
-            st["active"] = target
-            if info.get("cwd") and target not in st["cwds"]:
-                st["cwds"][target] = info["cwd"]
-            save_router_state(st)
+        init_cwd = {target: info["cwd"]} if (info.get("cwd") and target not in state.get("cwds", {})) else None
+        update_caller_session(active=target, cwd_updates=init_cwd)
         via_str = " -> ".join(resp.get("via") or [target])
         print(
             f"[rmcp] switched active target -> {target} "
-            f"(node={info.get('node_id')}, platform={info.get('platform')}, via={via_str})"
+            f"(node={info.get('node_id')}, platform={info.get('platform')}, via={via_str}, caller={state['caller']})"
         )
         return 0
 
@@ -2685,9 +3149,9 @@ def _handle_mgmt_command(cmd: str, args: list[str], explicit_to: str = "") -> in
         tok = tok_s or load_or_create_daemon_token()
         if alias_s:
             with _STATE_LOCK:
-                st = load_router_state()
-                st["alias"] = alias_s
-                save_router_state(st)
+                topo = load_topology_state()
+                topo["alias"] = alias_s
+                save_topology_state(topo)
         child_args = ["--listen", "--host", host, "--port", str(port), "--token", tok]
         if is_wd:
             child_args = ["--watchdog", *child_args]
@@ -2809,10 +3273,7 @@ def _handle_mgmt_command(cmd: str, args: list[str], explicit_to: str = "") -> in
             sys.stderr.write(f"[rmcp] :cd failed on '{target}': {resp.get('error')}\n")
             return 1
         new_cwd = (resp.get("result") or {}).get("cwd", "")
-        with _STATE_LOCK:
-            st = load_router_state()
-            st["cwds"][target] = new_cwd
-            save_router_state(st)
+        update_caller_session(cwd_updates={target: new_cwd})
         print(new_cwd)
         return 0
 
@@ -3106,15 +3567,9 @@ def run_repl(
                 pinfo = probe.get("result") or {}
                 via_banner = " -> ".join(probe.get("via") or [cur_target])
                 if pinfo.get("cwd") and cur_target not in state.get("cwds", {}):
-                    with _STATE_LOCK:
-                        st = load_router_state()
-                        st["cwds"][cur_target] = pinfo["cwd"]
-                        save_router_state(st)
-        else:
-            with _STATE_LOCK:
-                st = load_router_state()
-                st["cwds"].setdefault("self", str(Path.cwd()))
-                save_router_state(st)
+                    update_caller_session(cwd_updates={cur_target: pinfo["cwd"]})
+        elif "self" not in state.get("cwds", {}):
+            update_caller_session(cwd_updates={"self": str(Path.cwd())})
 
         if is_tty:
             print(
@@ -3248,6 +3703,7 @@ def run_repl(
 
 
 def cli_main(argv: list[str] | None = None) -> int:
+    global _SESSION_OVERRIDE
     raw = list(sys.argv[1:] if argv is None else argv)
     if not raw:
         if _is_interactive_tty():
@@ -3280,9 +3736,10 @@ def cli_main(argv: list[str] | None = None) -> int:
         print(f"rmcp {VERSION}")
         return 0
 
-    # 2. Optional leading `--to <target>` or `--timeout <sec>` before command
+    # 2. Optional leading `--to <target>`, `--timeout <sec>`, or `--session <name>` before command
     explicit_to = ""
     exec_timeout = 120.0
+    sess_override = ""
     idx = 0
     while idx < len(raw):
         if raw[idx] == "--to" and idx + 1 < len(raw):
@@ -3301,28 +3758,42 @@ def cli_main(argv: list[str] | None = None) -> int:
             exec_timeout = float(raw[idx].split("=", 1)[1])
             idx += 1
             continue
+        if raw[idx] == "--session" and idx + 1 < len(raw):
+            sess_override = raw[idx + 1]
+            idx += 2
+            continue
+        if raw[idx].startswith("--session="):
+            sess_override = raw[idx].split("=", 1)[1]
+            idx += 1
+            continue
         break
 
-    rem = raw[idx:]
-    if not rem:
-        if _is_interactive_tty():
-            return run_repl(pinned_to=explicit_to, exec_timeout=exec_timeout)
-        _print_help()
-        return 0
+    prev_sess = _SESSION_OVERRIDE
+    if sess_override:
+        _SESSION_OVERRIDE = sess_override
+    try:
+        rem = raw[idx:]
+        if not rem:
+            if _is_interactive_tty():
+                return run_repl(pinned_to=explicit_to, exec_timeout=exec_timeout)
+            _print_help()
+            return 0
 
-    if rem[0] in ("-i", "--repl", "--interactive"):
-        init_tgt = rem[1] if len(rem) > 1 else ""
-        return run_repl(initial_target=init_tgt, pinned_to=explicit_to, exec_timeout=exec_timeout)
+        if rem[0] in ("-i", "--repl", "--interactive"):
+            init_tgt = rem[1] if len(rem) > 1 else ""
+            return run_repl(initial_target=init_tgt, pinned_to=explicit_to, exec_timeout=exec_timeout)
 
-    # 3. Colon management command (`:use`, `:nodes`, ...) vs normal shell command pass-through
-    mgmt_cmd = _detect_mgmt_command(rem[0])
-    if mgmt_cmd is not None:
-        return _handle_mgmt_command(mgmt_cmd, rem[1:], explicit_to=explicit_to)
+        # 3. Colon management command (`:use`, `:nodes`, ...) vs normal shell command pass-through
+        mgmt_cmd = _detect_mgmt_command(rem[0])
+        if mgmt_cmd is not None:
+            return _handle_mgmt_command(mgmt_cmd, rem[1:], explicit_to=explicit_to)
 
-    state = load_router_state()
-    target = _resolve_active_target(explicit_to, state)
-    cmd_str = _format_passthrough_cmd(rem, _is_target_windows(target, state))
-    return _exec_remote_shell(target, cmd_str, state, exec_timeout=exec_timeout)
+        state = load_router_state()
+        target = _resolve_active_target(explicit_to, state)
+        cmd_str = _format_passthrough_cmd(rem, _is_target_windows(target, state))
+        return _exec_remote_shell(target, cmd_str, state, exec_timeout=exec_timeout)
+    finally:
+        _SESSION_OVERRIDE = prev_sess
 
 
 if __name__ == "__main__":

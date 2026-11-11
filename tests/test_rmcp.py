@@ -25,15 +25,24 @@ from tests import mock_agent  # noqa: E402
 RMCP_SCRIPT = str(ROOT_DIR / "rmcp.py")
 
 
-def run_cli(state_dir: Path, *args: str, alias: str = "") -> subprocess.CompletedProcess[str]:
+def run_cli(
+    state_dir: Path,
+    *args: str,
+    alias: str = "",
+    cwd: Path | None = None,
+    extra_env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     env["REMOTE_MCP_STATE_DIR"] = str(state_dir)
     env["RMCP_STATE_DIR"] = str(state_dir)
     if alias:
         env["REMOTE_MCP_NODE_ALIAS"] = alias
+    if extra_env:
+        env.update(extra_env)
     env["PYTHONIOENCODING"] = "utf-8"
     return subprocess.run(
         [sys.executable, RMCP_SCRIPT, *args],
+        cwd=str(cwd) if cwd else None,
         env=env,
         capture_output=True,
         text=True,
@@ -485,6 +494,170 @@ class InteractiveReplAndPersistentHopTest(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, full_txt)
             self.assertIn("interactive mode", full_txt)
             self.assertIn("PTY_AUTO_REPL_OK", full_txt)
+
+
+class CallerSessionIsolationAndOriginTest(unittest.TestCase):
+    def test_multi_caller_folder_and_agent_isolation_plus_persisted_spawn_origin(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            shared_state = base / "shared_client_state"
+            dir_b = base / "nodeB"
+            dir_c = base / "nodeC"
+
+            # Simulated local caller workspaces
+            bot_repo = base / "bot"
+            (bot_repo / ".git").mkdir(parents=True, exist_ok=True)
+            bot_subdir = bot_repo / "mods" / "tools"
+            bot_subdir.mkdir(parents=True, exist_ok=True)
+
+            other_ws = base / "other_workspace"
+            other_ws.mkdir(parents=True, exist_ok=True)
+
+            # Simulated remote working directories
+            rem_bot_b = base / "rem_bot_on_B"
+            rem_agy_b = base / "rem_agy_on_B"
+            rem_agy_c = base / "rem_agy_on_C"
+            for d in (rem_bot_b, rem_agy_b, rem_agy_c):
+                d.mkdir(parents=True, exist_ok=True)
+
+            bot_env = {
+                "ANTIGRAVITY_CONVERSATION_ID": "",
+                "CODEX_THREAD_ID": "",
+                "CLAUDE_SESSION_ID": "",
+                "RMCP_SESSION": "",
+            }
+            agy_env = {
+                "ANTIGRAVITY_CONVERSATION_ID": "conv-agy-isolated-9999",
+                "CODEX_THREAD_ID": "",
+                "CLAUDE_SESSION_ID": "",
+                "RMCP_SESSION": "",
+            }
+
+            # Initialize aliases: client, nodeB, nodeC, and 2-hop topology client -> nodeB -> nodeC
+            self.assertEqual(
+                run_cli(shared_state, ":id", "--alias", "linuxHost", cwd=bot_repo, extra_env=bot_env).returncode,
+                0,
+            )
+            self.assertEqual(run_cli(dir_b, ":id", "--alias", "nodeB").returncode, 0)
+            self.assertEqual(run_cli(dir_c, ":id", "--alias", "nodeC").returncode, 0)
+            self.assertEqual(
+                run_cli(
+                    shared_state, ":connect", "nodeB", f"local://{dir_b}", cwd=bot_repo, extra_env=bot_env
+                ).returncode,
+                0,
+            )
+            self.assertEqual(run_cli(dir_b, ":connect", "nodeC", f"local://{dir_c}").returncode, 0)
+
+            # 1. Bot caller (`bot_repo`) sets `:use nodeB` and `:cd rem_bot_b`
+            self.assertEqual(
+                run_cli(shared_state, ":use", "nodeB", cwd=bot_repo, extra_env=bot_env).returncode, 0
+            )
+            self.assertEqual(
+                run_cli(shared_state, ":cd", str(rem_bot_b), cwd=bot_repo, extra_env=bot_env).returncode, 0
+            )
+
+            # 2. Antigravity caller standing IN THE EXACT SAME `bot_repo` folder switches to `nodeC` & `rem_agy_c`,
+            #    AND sets its own cwd on `nodeB` to `rem_agy_b`!
+            self.assertEqual(
+                run_cli(shared_state, ":use", "nodeC", cwd=bot_repo, extra_env=agy_env).returncode, 0
+            )
+            self.assertEqual(
+                run_cli(shared_state, ":cd", str(rem_agy_c), cwd=bot_repo, extra_env=agy_env).returncode, 0
+            )
+            self.assertEqual(
+                run_cli(
+                    shared_state, "--to", "nodeB", ":cd", str(rem_agy_b), cwd=bot_repo, extra_env=agy_env
+                ).returncode,
+                0,
+            )
+
+            # 3. Third caller in `other_ws` sees shared topology (`nodeB`) without interfering with either!
+            other_nodes = json.loads(
+                run_cli(shared_state, ":nodes", cwd=other_ws, extra_env=bot_env).stdout
+            )
+            self.assertIn("nodeB", other_nodes["peers"])
+
+            # 4. Verify Bot caller — EVEN FROM SUBFOLDER `bot/mods/tools` (git-root anchoring!) —
+            #    remains on `nodeB` in `rem_bot_b`!
+            bot_state = json.loads(
+                run_cli(shared_state, ":nodes", cwd=bot_subdir, extra_env=bot_env).stdout
+            )
+            self.assertEqual(bot_state["active"], "nodeB")
+            bot_pwd = run_cli(shared_state, ":pwd", cwd=bot_subdir, extra_env=bot_env).stdout.strip()
+            self.assertEqual(Path(bot_pwd).resolve(), rem_bot_b.resolve())
+
+            # 5. Verify Antigravity caller remains on `nodeC` in `rem_agy_c` AND its `nodeB` cwd is `rem_agy_b`!
+            agy_state = json.loads(
+                run_cli(shared_state, ":nodes", cwd=bot_repo, extra_env=agy_env).stdout
+            )
+            self.assertEqual(agy_state["active"], "nodeC")
+            agy_pwd_c = run_cli(shared_state, ":pwd", cwd=bot_repo, extra_env=agy_env).stdout.strip()
+            self.assertEqual(Path(agy_pwd_c).resolve(), rem_agy_c.resolve())
+            agy_pwd_b = run_cli(
+                shared_state, "--to", "nodeB", ":pwd", cwd=bot_repo, extra_env=agy_env
+            ).stdout.strip()
+            self.assertEqual(Path(agy_pwd_b).resolve(), rem_agy_b.resolve())
+
+            # 6. Verify `--session` explicit override and `:sessions` listing / clearing
+            self.assertEqual(
+                run_cli(
+                    shared_state, "--session", "manual-ops", ":use", "self", cwd=bot_repo, extra_env=bot_env
+                ).returncode,
+                0,
+            )
+            sess_list = json.loads(
+                run_cli(
+                    shared_state, "--session", "manual-ops", ":sessions", cwd=bot_repo, extra_env=bot_env
+                ).stdout
+            )
+            self.assertGreaterEqual(len(sess_list["sessions"]), 3)
+            self.assertTrue(sess_list["sessions"][0]["current"])
+            self.assertIn("session:manual-ops", sess_list["current_caller"])
+            self.assertEqual(
+                run_cli(
+                    shared_state,
+                    "--session",
+                    "manual-ops",
+                    ":sessions",
+                    "--clear",
+                    cwd=bot_repo,
+                    extra_env=bot_env,
+                ).returncode,
+                0,
+            )
+
+            # 7. Multi-hop `origin` provenance + persisted `:spawn` / `:ps` / `:kill` across one-shot stdio hops!
+            sp = run_cli(
+                shared_state,
+                "--to",
+                "nodeC",
+                ":spawn",
+                sys.executable,
+                "-c",
+                "import time; time.sleep(30)",
+                cwd=bot_subdir,
+                extra_env=bot_env,
+            )
+            self.assertEqual(sp.returncode, 0, sp.stderr)
+            sp_info = json.loads(sp.stdout)
+            sp_pid = sp_info["pid"]
+            self.assertIn(str(bot_repo.resolve()), sp_info["caller"])
+
+            # Separate one-shot invocation from Antigravity queries `:ps` on `nodeC` -> sees running PID + Bot's caller!
+            ps_res = run_cli(shared_state, ":ps", cwd=bot_repo, extra_env=agy_env)
+            self.assertEqual(ps_res.returncode, 0, ps_res.stderr)
+            procs = json.loads(ps_res.stdout)["processes"]
+            matched = [p for p in procs if p["pid"] == sp_pid]
+            self.assertEqual(len(matched), 1, f"Persisted spawned PID {sp_pid} missing from :ps: {procs}")
+            self.assertEqual(matched[0]["status"], "running")
+            self.assertIn("linuxHost:", matched[0]["caller"])
+            self.assertIn(str(bot_repo.resolve()), matched[0]["caller"])
+
+            # Kill across a third separate `--stdio-hop` invocation!
+            kl = run_cli(
+                shared_state, "--to", "nodeC", ":kill", str(sp_pid), "KILL", cwd=bot_subdir, extra_env=bot_env
+            )
+            self.assertEqual(kl.returncode, 0, kl.stderr)
 
 
 if __name__ == "__main__":

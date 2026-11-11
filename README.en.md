@@ -18,6 +18,7 @@ Cross-platform (Linux & Windows) remote execution toolkit with two entrypoints:
 
 1. **`rmcp.py` (Zero-dependency single-file CLI + Interactive REPL + Multi-Hop Encrypted Mesh Router + Remote Node)** — built for both one-shot bots and interactive human shells:
    - **Normal command pass-through & Interactive REPL**: running `python rmcp.py` in a TTY (or `python rmcp.py :repl [target]` / `-i`) opens an interactive shell with persistent multi-hop pipe reuse, readline history, Tab completion, raw shell pipelines (`|`, `>`, `&&`), `!<local_cmd>`, and `:q` to exit; in non-TTY / one-shot invocations, any command not starting with `:` runs directly on the active remote node, preserving `cwd` and propagating exit codes.
+   - **Shared mesh topology + per-caller session isolation (zero multi-agent crosstalk)**: `router.json` shares peers and routes machine-wide, while mutable `:use` target and per-node `cwds` are isolated into `sessions/<hash>.json` keyed by `(node_id, project_root_or_cwd, agent_conversation_id)` (or explicit `--session <name>` / `RMCP_SESSION`); envelopes carry `origin` provenance across hops so remote `:ps` attributes background processes to their exact caller.
    - **`:` management commands**: commands starting with `:` (Vim-style — literal across Bash, Zsh, Fish, Git Bash, `cmd.exe`, and PowerShell with zero path-expansion collisions) manage node connections, active target switching, multi-hop routing tables, file transfers, background processes, and boot autostart.
    - **Router-like multi-hop forwarding + anti-broadcast-storm**: each host has a deterministic `node_id`; edges are recorded passively on connection (no background polling), packets route via `local -> direct/reverse peers -> cached unicast route -> controlled flood discovery`, and broadcast storms are prevented via `pkt_id` deduplication, `ttl` hop decrement, and `via` split-horizon loop detection.
    - **SSH preferred (persistent multiplexing) + self-bootstrap + encrypted HTTP listener + outbound reverse tunnel (`--dial`)**:
@@ -94,7 +95,8 @@ python rmcp.py :repl nat-pc                   # or simply run `python rmcp.py` i
 | `:help` | Show CLI usage and command reference |
 | `:repl [target]` (`:shell`, `-i`) | Enter interactive REPL (persistent multi-hop pipes, history, Tab completion, `:q` to exit) |
 | `:local <cmd>` (`!<cmd>` inside REPL) | Run a command on THIS local machine without changing active `:use` target |
-| `:id [--alias <name>]` | Show deterministic `node_id` and alias (or set local alias) |
+| `:id [--alias <name>]` | Show deterministic `node_id`, alias, and current caller origin (`caller`) |
+| `:sessions [--clear\|--clear-all]` | List or clear isolated per-caller sessions on this machine |
 | `:nodes` (`:peers`, `:routes`) | Show local or remote node's peers, cached routes, and reverse sessions |
 | `:connect <alias> <endpoint> [--bootstrap] [--token T] [--via <hop>]` | Connect and record an SSH or HTTP peer edge |
 | `:disconnect <alias> [--via <hop>]` | Remove a recorded peer edge and invalidated routes |
