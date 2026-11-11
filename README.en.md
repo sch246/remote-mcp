@@ -17,14 +17,14 @@
 Cross-platform (Linux & Windows) remote execution toolkit with two entrypoints:
 
 1. **`rmcp.py` (Zero-dependency single-file CLI + Multi-Hop Encrypted Mesh Router + Remote Node)** — built for one-shot bots (without interactive REPL support) and multi-hop networks:
-   - **Normal command pass-through**: any command not starting with `/` runs directly on the active remote node, preserving working directory (`cwd`) across invocations and propagating the exact exit code.
-   - **`/` management commands**: commands starting with `/` manage node connections, active target switching, multi-hop routing tables, file transfers, background processes, and boot autostart (supports `//nodes` on Windows Git Bash to avoid MSYS path expansion).
+   - **Normal command pass-through**: any command not starting with `:` runs directly on the active remote node, preserving working directory (`cwd`) across invocations and propagating the exact exit code.
+   - **`:` management commands**: commands starting with `:` (Vim-style — literal across Bash, Zsh, Fish, Git Bash, `cmd.exe`, and PowerShell with zero path-expansion collisions) manage node connections, active target switching, multi-hop routing tables, file transfers, background processes, and boot autostart.
    - **Router-like multi-hop forwarding + anti-broadcast-storm**: each host has a deterministic `node_id`; edges are recorded passively on connection (no background polling), packets route via `local -> direct/reverse peers -> cached unicast route -> controlled flood discovery`, and broadcast storms are prevented via `pkt_id` deduplication, `ttl` hop decrement, and `via` split-horizon loop detection.
    - **SSH preferred + self-bootstrap + encrypted HTTP listener + outbound reverse tunnel (`--dial`)**:
      - Over SSH, Base64-framed envelopes stream over `ssh --stdio-hop` pipes — bypassing `bash`/`cmd.exe` multi-hop quoting issues and Windows GBK mojibake. `--bootstrap` automatically streams `rmcp.py` to `~/.rmcp/rmcp.py` on the target, and `--via <hop>` lets an intermediate jump host connect onward using **its own SSH keys or private network access**.
      - On SSH-less machines, `--listen` binds an HTTP port with token-derived authenticated encryption (`BLAKE2b-CTR + HMAC-SHA256`) while staying backward-compatible with legacy `agent.py` v0.4.
      - On NAT / inbound-blocked machines without SSH, `--dial <hub_url> --token <T>` establishes an outbound long-polling reverse tunnel to any listening hub node so the whole mesh can route into it.
-     - Built-in `--watchdog` crash supervisor and `/autostart on` (silent user `Startup` `.vbs` on Windows requiring no admin rights; user `crontab @reboot` on Linux).
+     - Built-in `--watchdog` crash supervisor and `:autostart on` (silent user `Startup` `.vbs` on Windows requiring no admin rights; user `crontab @reboot` on Linux).
 2. **`server.py` + `agent.py` (MCP Server + Lightweight HTTP Agent)** — exposes 14 `remote_*` MCP tools to Claude Code and other MCP clients.
 
 ```
@@ -39,32 +39,32 @@ Bot / Shell ──▶ rmcp.py (CLI) ══ SSH stdio ══▶ Jump rmcp.py ═�
 
 ```bash
 # A. Connect over SSH (auto-bootstraps ~/.rmcp/rmcp.py if missing)
-python rmcp.py /connect win6 ssh://user@10.12.23.6 --bootstrap
+python rmcp.py :connect win6 ssh://user@10.12.23.6 --bootstrap
 
 # B. Ask jump host `win6` to connect onward using ITS OWN SSH keys / LAN access
-python rmcp.py /connect inner-linux ssh://dev@192.168.50.10 --via win6 --bootstrap
+python rmcp.py :connect inner-linux ssh://dev@192.168.50.10 --via win6 --bootstrap
 
 # C. SSH-less target: start encrypted HTTP listener (writes token to agent.token)
-python rmcp.py /listen --port 7777 --watchdog --daemon
-python rmcp.py /autostart on --port 7777 --local   # enable boot autostart + watchdog
+python rmcp.py :listen --port 7777 --watchdog --daemon
+python rmcp.py :autostart on --port 7777 --local   # enable boot autostart + watchdog
 
 # Connect to that HTTP node directly or via a jump host
-python rmcp.py /connect box7 http://192.168.50.20:7777 --token <TOKEN> --via win6
+python rmcp.py :connect box7 http://192.168.50.20:7777 --token <TOKEN> --via win6
 
 # D. Inbound-blocked NAT host (no SSH, no open ports): dial outbound to a hub
-python rmcp.py /dial http://10.12.23.6:7777 --token <HUB_TOKEN> --alias nat-pc --watchdog --daemon
+python rmcp.py :dial http://10.12.23.6:7777 --token <HUB_TOKEN> --alias nat-pc --watchdog --daemon
 ```
 
 ### 2. Daily CLI Usage (One-Shot Bot Friendly)
 
-Once edges are recorded anywhere in the mesh, `/use <alias_or_node_id>` discovers and caches the multi-hop path automatically:
+Once edges are recorded anywhere in the mesh, `:use <alias_or_node_id>` discovers and caches the multi-hop path automatically:
 
 ```bash
-python rmcp.py /nodes                         # inspect peers, cached routes, and active target
-python rmcp.py /use nat-pc                    # auto-discover path (e.g. local -> win6 -> nat-pc)
-python rmcp.py /ping                          # inspect end-to-end `via` hops
+python rmcp.py :nodes                         # inspect peers, cached routes, and active target
+python rmcp.py :use nat-pc                    # auto-discover path (e.g. local -> win6 -> nat-pc)
+python rmcp.py :ping                          # inspect end-to-end `via` hops
 
-# Commands without leading `/` pass straight through with persistent remote cwd
+# Commands without leading `:` pass straight through with persistent remote cwd
 python rmcp.py cd D:/github/remote-mcp
 python rmcp.py git status -sb
 python rmcp.py python -c "print('clean multi-hop quotes & UTF-8!')"
@@ -73,32 +73,32 @@ python rmcp.py python -c "print('clean multi-hop quotes & UTF-8!')"
 python rmcp.py --to win6 hostname
 
 # Multi-hop file read/write/edit & SHA-256 verified streaming upload/download
-python rmcp.py /read D:/github/remote-mcp/README.md
-python rmcp.py /write /tmp/hello.txt "hello mesh"
-python rmcp.py /edit /tmp/hello.txt hello hi
-python rmcp.py /upload ./build.zip D:/releases/build.zip
-python rmcp.py /download D:/logs/app.log ./app.log
+python rmcp.py :read D:/github/remote-mcp/README.md
+python rmcp.py :write /tmp/hello.txt "hello mesh"
+python rmcp.py :edit /tmp/hello.txt hello hi
+python rmcp.py :upload ./build.zip D:/releases/build.zip
+python rmcp.py :download D:/logs/app.log ./app.log
 ```
 
-### 3. `/` Management Command Reference
+### 3. `:` Management Command Reference
 
 | Command | Purpose |
 |---|---|
-| `/help` | Show CLI usage and command reference |
-| `/id [--alias <name>]` | Show deterministic `node_id` and alias (or set local alias) |
-| `/nodes` (`/peers`, `/routes`) | Show local or remote node's peers, cached routes, and reverse sessions |
-| `/connect <alias> <endpoint> [--bootstrap] [--token T] [--via <hop>]` | Connect and record an SSH or HTTP peer edge |
-| `/disconnect <alias> [--via <hop>]` | Remove a recorded peer edge and invalidated routes |
-| `/use <target>` (`/to <target>`) | Probe reachability and switch active target (`/use self` for local) |
-| `/listen [--port 7777] [--token T] [--daemon] [--watchdog]` | Run encrypted HTTP router + reverse-tunnel hub |
-| `/dial <hub_url> --token <T> [--alias A] [--daemon] [--watchdog]` | Dial outbound reverse long-polling tunnel into a hub |
-| `/autostart [status\|on\|off] [--port P] [--dial URL --token T] [--local]` | Configure boot autostart on active target (or `--local`) |
-| `/ping [target]` / `/env [target]` | Probe hop path / inspect OS, shells, Python, and disk |
-| `/pwd` / `/cd <dir>` | Show or change persistent working directory for active target |
-| `/read` / `/write` / `/edit` | Read, atomically write, or replace unique text on remote files (≤ 8 MiB) |
-| `/upload <local> <remote>` / `/download <remote> <local>` | Chunked streaming transfer with end-to-end SHA-256 verification |
-| `/spawn <cmd> [--stdout <log>]` / `/ps` / `/kill <pid>` | Manage detached background processes on target |
-| `/shutdown [--delay sec]` | Cleanly stop a remote HTTP/dial daemon |
+| `:help` | Show CLI usage and command reference |
+| `:id [--alias <name>]` | Show deterministic `node_id` and alias (or set local alias) |
+| `:nodes` (`:peers`, `:routes`) | Show local or remote node's peers, cached routes, and reverse sessions |
+| `:connect <alias> <endpoint> [--bootstrap] [--token T] [--via <hop>]` | Connect and record an SSH or HTTP peer edge |
+| `:disconnect <alias> [--via <hop>]` | Remove a recorded peer edge and invalidated routes |
+| `:use <target>` (`:to <target>`) | Probe reachability and switch active target (`:use self` for local) |
+| `:listen [--port 7777] [--token T] [--daemon] [--watchdog]` | Run encrypted HTTP router + reverse-tunnel hub |
+| `:dial <hub_url> --token <T> [--alias A] [--daemon] [--watchdog]` | Dial outbound reverse long-polling tunnel into a hub |
+| `:autostart [status\|on\|off] [--port P] [--dial URL --token T] [--local]` | Configure boot autostart on active target (or `--local`) |
+| `:ping [target]` / `:env [target]` | Probe hop path / inspect OS, shells, Python, and disk |
+| `:pwd` / `:cd <dir>` | Show or change persistent working directory for active target |
+| `:read` / `:write` / `:edit` | Read, atomically write, or replace unique text on remote files (≤ 8 MiB) |
+| `:upload <local> <remote>` / `:download <remote> <local>` | Chunked streaming transfer with end-to-end SHA-256 verification |
+| `:spawn <cmd> [--stdout <log>]` / `:ps` / `:kill <pid>` | Manage detached background processes on target |
+| `:shutdown [--delay sec]` | Cleanly stop a remote HTTP/dial daemon |
 
 ---
 

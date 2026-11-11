@@ -66,15 +66,15 @@ class CryptoAndParserTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             rmcp.decrypt_obj(old_box, "super-secret-token")
 
-    def test_slash_command_detection_and_msys_escape(self):
-        self.assertEqual(rmcp._detect_slash_command("/nodes"), "nodes")
-        self.assertEqual(rmcp._detect_slash_command("//connect"), "connect")
-        self.assertEqual(rmcp._detect_slash_command("C:/Program Files/Git/nodes"), "nodes")
-        self.assertEqual(rmcp._detect_slash_command(r"C:\Program Files\Git\use"), "use")
-        # Real POSIX paths with 2+ slashes must pass through as shell commands!
-        self.assertIsNone(rmcp._detect_slash_command("/bin/echo"))
-        self.assertIsNone(rmcp._detect_slash_command("/usr/bin/python3"))
-        self.assertIsNone(rmcp._detect_slash_command("echo"))
+    def test_colon_command_detection(self):
+        self.assertEqual(rmcp._detect_mgmt_command(":nodes"), "nodes")
+        self.assertEqual(rmcp._detect_mgmt_command(":Connect"), "connect")
+        self.assertEqual(rmcp._detect_mgmt_command(":use"), "use")
+        # Bare ':', paths starting with '/', and normal commands pass straight through!
+        self.assertIsNone(rmcp._detect_mgmt_command(":"))
+        self.assertIsNone(rmcp._detect_mgmt_command("/nodes"))
+        self.assertIsNone(rmcp._detect_mgmt_command("/bin/echo"))
+        self.assertIsNone(rmcp._detect_mgmt_command("echo"))
 
 
 class MeshRouterAndStormTest(unittest.TestCase):
@@ -88,20 +88,20 @@ class MeshRouterAndStormTest(unittest.TestCase):
 
             # Initialize aliases on all 4 nodes
             for d, name in ((dir_a, "nodeA"), (dir_b, "nodeB"), (dir_c, "nodeC"), (dir_d, "nodeD")):
-                rc = run_cli(d, "/id", "--alias", name)
+                rc = run_cli(d, ":id", "--alias", name)
                 self.assertEqual(rc.returncode, 0, rc.stderr)
 
             # Build a triangle cycle A -> B -> C -> A plus a leaf B -> D:
             # A -> B
-            self.assertEqual(run_cli(dir_a, "/connect", "nodeB", f"local://{dir_b}").returncode, 0)
+            self.assertEqual(run_cli(dir_a, ":connect", "nodeB", f"local://{dir_b}").returncode, 0)
             # B -> C and B -> D
-            self.assertEqual(run_cli(dir_b, "/connect", "nodeC", f"local://{dir_c}").returncode, 0)
-            self.assertEqual(run_cli(dir_b, "/connect", "nodeD", f"local://{dir_d}").returncode, 0)
+            self.assertEqual(run_cli(dir_b, ":connect", "nodeC", f"local://{dir_c}").returncode, 0)
+            self.assertEqual(run_cli(dir_b, ":connect", "nodeD", f"local://{dir_d}").returncode, 0)
             # C -> A (closes the routing cycle!)
-            self.assertEqual(run_cli(dir_c, "/connect", "nodeA", f"local://{dir_a}").returncode, 0)
+            self.assertEqual(run_cli(dir_c, ":connect", "nodeA", f"local://{dir_a}").returncode, 0)
 
             # 1. Node A pings `nodeD` (2 hops away: A -> B -> D) with zero prior route configuration!
-            ping_res = run_cli(dir_a, "/ping", "nodeD")
+            ping_res = run_cli(dir_a, ":ping", "nodeD")
             self.assertEqual(ping_res.returncode, 0, ping_res.stderr)
             data = json.loads(ping_res.stdout)
             self.assertTrue(data["ok"])
@@ -109,31 +109,31 @@ class MeshRouterAndStormTest(unittest.TestCase):
             self.assertEqual(data["via"], ["nodeA", "nodeB", "nodeD"])
 
             # 2. Verify Node A learned and cached the unicast route `nodeD -> next_hop: nodeB`
-            nodes_res = run_cli(dir_a, "/nodes")
+            nodes_res = run_cli(dir_a, ":nodes")
             self.assertEqual(nodes_res.returncode, 0)
             a_state = json.loads(nodes_res.stdout)
             self.assertIn("nodeD", a_state["routes"])
             self.assertEqual(a_state["routes"]["nodeD"]["next_hop"], "nodeB")
 
             # 3. Switch active target to `nodeD` and run a shell command directly!
-            self.assertEqual(run_cli(dir_a, "/use", "nodeD").returncode, 0)
+            self.assertEqual(run_cli(dir_a, ":use", "nodeD").returncode, 0)
             exec_res = run_cli(dir_a, sys.executable, "-c", "print('hello from D 喵')")
             self.assertEqual(exec_res.returncode, 0, exec_res.stderr)
             self.assertIn("hello from D 喵", exec_res.stdout)
 
             # 4. Anti-broadcast-storm test on unreachable target inside cycle A -> B -> C -> A!
-            ghost_res = run_cli(dir_a, "/ping", "ghost-node-999")
+            ghost_res = run_cli(dir_a, ":ping", "ghost-node-999")
             self.assertNotEqual(ghost_res.returncode, 0)
             self.assertIn("no route to 'ghost-node-999'", ghost_res.stderr)
 
-            # 5. Delegated `/connect --via nodeC` (connect a 5th nodeE using nodeC's local credentials/network)
+            # 5. Delegated `:connect --via nodeC` (connect a 5th nodeE using nodeC's local credentials/network)
             dir_e = base / "nodeE"
-            self.assertEqual(run_cli(dir_e, "/id", "--alias", "nodeE").returncode, 0)
-            delegated = run_cli(dir_a, "/connect", "nodeE", f"local://{dir_e}", "--via", "nodeC")
+            self.assertEqual(run_cli(dir_e, ":id", "--alias", "nodeE").returncode, 0)
+            delegated = run_cli(dir_a, ":connect", "nodeE", f"local://{dir_e}", "--via", "nodeC")
             self.assertEqual(delegated.returncode, 0, delegated.stderr)
 
             # Node A is now active on nodeE (3 hops: A -> B -> C -> E)!
-            hop3_ping = run_cli(dir_a, "/ping")
+            hop3_ping = run_cli(dir_a, ":ping")
             self.assertEqual(hop3_ping.returncode, 0, hop3_ping.stderr)
             hop3_data = json.loads(hop3_ping.stdout)
             self.assertEqual(hop3_data["via"], ["nodeA", "nodeB", "nodeC", "nodeE"])
@@ -219,18 +219,18 @@ class HttpAndReverseTunnelTest(unittest.TestCase):
                 self.assertTrue(ready, "Hub H failed to start listening")
 
                 # Build hybrid topology: cliA --(stdio/SSH)--> hopB --(HTTP)--> hubH <--(Reverse)-- nat-box
-                self.assertEqual(run_cli(dir_cli, "/id", "--alias", "cliA").returncode, 0)
-                self.assertEqual(run_cli(dir_hop, "/id", "--alias", "hopB").returncode, 0)
-                self.assertEqual(run_cli(dir_cli, "/connect", "hopB", f"local://{dir_hop}").returncode, 0)
+                self.assertEqual(run_cli(dir_cli, ":id", "--alias", "cliA").returncode, 0)
+                self.assertEqual(run_cli(dir_hop, ":id", "--alias", "hopB").returncode, 0)
+                self.assertEqual(run_cli(dir_cli, ":connect", "hopB", f"local://{dir_hop}").returncode, 0)
                 self.assertEqual(
-                    run_cli(dir_hop, "/connect", "hubH", hub_url, "--token", hub_tok).returncode,
+                    run_cli(dir_hop, ":connect", "hubH", hub_url, "--token", hub_tok).returncode,
                     0,
                 )
 
                 # Wait up to 5s for `nat-box` reverse session to appear on hubH
                 rev_ok = False
                 for _ in range(25):
-                    p = run_cli(dir_cli, "/ping", "nat-box")
+                    p = run_cli(dir_cli, ":ping", "nat-box")
                     if p.returncode == 0:
                         rev_ok = True
                         pdata = json.loads(p.stdout)
@@ -240,41 +240,41 @@ class HttpAndReverseTunnelTest(unittest.TestCase):
                 self.assertTrue(rev_ok, "Reverse client nat-box was not reachable across A->B->H->nat-box")
 
                 # Switch active node on cliA to `nat-box`
-                self.assertEqual(run_cli(dir_cli, "/use", "nat-box").returncode, 0)
+                self.assertEqual(run_cli(dir_cli, ":use", "nat-box").returncode, 0)
 
                 # Test cwd persistence across one-shot runs!
-                self.assertEqual(run_cli(dir_cli, "/cd", str(work_dir)).returncode, 0)
-                pwd1 = run_cli(dir_cli, "/pwd")
+                self.assertEqual(run_cli(dir_cli, ":cd", str(work_dir)).returncode, 0)
+                pwd1 = run_cli(dir_cli, ":pwd")
                 self.assertEqual(Path(pwd1.stdout.strip()).resolve(), work_dir.resolve())
 
                 # Shell `cd inner_dir` inside normal command should ALSO persist to next one-shot run!
                 cd_shell = run_cli(dir_cli, f"cd {sub_dir.name}")
                 self.assertEqual(cd_shell.returncode, 0, cd_shell.stderr)
-                pwd2 = run_cli(dir_cli, "/pwd")
+                pwd2 = run_cli(dir_cli, ":pwd")
                 self.assertEqual(Path(pwd2.stdout.strip()).resolve(), sub_dir.resolve())
 
                 # Non-zero exit code propagation
                 bad_cmd = run_cli(dir_cli, sys.executable, "-c", "import sys; sys.exit(42)")
                 self.assertEqual(bad_cmd.returncode, 42)
 
-                # File /write, /edit, /read over 3-hop reverse mesh
+                # File :write, :edit, :read over 3-hop reverse mesh
                 remote_txt = sub_dir / "note.txt"
-                self.assertEqual(run_cli(dir_cli, "/write", str(remote_txt), "alpha beta 喵").returncode, 0)
-                self.assertEqual(run_cli(dir_cli, "/edit", str(remote_txt), "beta", "omega").returncode, 0)
-                rd = run_cli(dir_cli, "/read", str(remote_txt))
+                self.assertEqual(run_cli(dir_cli, ":write", str(remote_txt), "alpha beta 喵").returncode, 0)
+                self.assertEqual(run_cli(dir_cli, ":edit", str(remote_txt), "beta", "omega").returncode, 0)
+                rd = run_cli(dir_cli, ":read", str(remote_txt))
                 self.assertEqual(rd.returncode, 0, rd.stderr)
                 self.assertEqual(rd.stdout, "alpha omega 喵")
 
-                # Multi-chunk (> 512 KiB) binary /upload and /download with SHA-256 verification
+                # Multi-chunk (> 512 KiB) binary :upload and :download with SHA-256 verification
                 src_bin = base / "local_payload.bin"
                 dst_bin = sub_dir / "remote_payload.bin"
                 dl_bin = base / "downloaded_payload.bin"
                 blob = os.urandom(600 * 1024)  # > STREAM_CHUNK (512 KiB) -> multi-chunk transfer!
                 src_bin.write_bytes(blob)
 
-                up = run_cli(dir_cli, "/upload", str(src_bin), str(dst_bin))
+                up = run_cli(dir_cli, ":upload", str(src_bin), str(dst_bin))
                 self.assertEqual(up.returncode, 0, up.stderr)
-                dl = run_cli(dir_cli, "/download", str(dst_bin), str(dl_bin))
+                dl = run_cli(dir_cli, ":download", str(dst_bin), str(dl_bin))
                 self.assertEqual(dl.returncode, 0, dl.stderr)
                 self.assertEqual(dl_bin.read_bytes(), blob)
                 self.assertEqual(
@@ -282,17 +282,17 @@ class HttpAndReverseTunnelTest(unittest.TestCase):
                     hashlib.sha256(blob).hexdigest(),
                 )
 
-                # Background process /spawn, /ps, /kill on remote nat-box
-                sp = run_cli(dir_cli, "/spawn", sys.executable, "-c", "import time; time.sleep(30)")
+                # Background process :spawn, :ps, :kill on remote nat-box
+                sp = run_cli(dir_cli, ":spawn", sys.executable, "-c", "import time; time.sleep(30)")
                 self.assertEqual(sp.returncode, 0, sp.stderr)
                 sp_pid = json.loads(sp.stdout)["pid"]
 
-                ps1 = run_cli(dir_cli, "/ps")
+                ps1 = run_cli(dir_cli, ":ps")
                 self.assertEqual(ps1.returncode, 0)
                 pids = [p["pid"] for p in json.loads(ps1.stdout)["processes"]]
                 self.assertIn(sp_pid, pids)
 
-                kl = run_cli(dir_cli, "/kill", str(sp_pid), "KILL")
+                kl = run_cli(dir_cli, ":kill", str(sp_pid), "KILL")
                 self.assertEqual(kl.returncode, 0, kl.stderr)
             finally:
                 nat_proc.kill()
@@ -311,7 +311,7 @@ class LegacyAgentCompatTest(unittest.TestCase):
             with tempfile.TemporaryDirectory() as tmp:
                 cli_dir = Path(tmp) / "cli"
                 url = f"http://127.0.0.1:{port}"
-                c = run_cli(cli_dir, "/connect", "oldbox", url, "--token", mock_agent.TOKEN)
+                c = run_cli(cli_dir, ":connect", "oldbox", url, "--token", mock_agent.TOKEN)
                 self.assertEqual(c.returncode, 0, c.stderr)
 
                 ex = run_cli(cli_dir, "echo legacy_works")
@@ -319,8 +319,8 @@ class LegacyAgentCompatTest(unittest.TestCase):
                 self.assertIn("legacy_works", ex.stdout)
 
                 target_f = Path(tmp) / "legacy_file.txt"
-                self.assertEqual(run_cli(cli_dir, "/write", str(target_f), "v04-ok").returncode, 0)
-                rd = run_cli(cli_dir, "/read", str(target_f))
+                self.assertEqual(run_cli(cli_dir, ":write", str(target_f), "v04-ok").returncode, 0)
+                rd = run_cli(cli_dir, ":read", str(target_f))
                 self.assertEqual(rd.returncode, 0)
                 self.assertEqual(rd.stdout, "v04-ok")
         finally:

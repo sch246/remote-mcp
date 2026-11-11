@@ -6,7 +6,7 @@ Zero external dependencies (Python 3.10+ stdlib only). Runs identically on
 Linux and Windows. One file serves four roles:
   1. One-shot CLI for bots & humans:
        python rmcp.py <command...>        # pass-through to active remote node
-       python rmcp.py /<mgmt-cmd> ...     # router & node management commands
+       python rmcp.py :<mgmt-cmd> ...     # router & node management commands
   2. SSH stdio router hop (invoked automatically over SSH stdin/stdout):
        python rmcp.py --stdio-hop
   3. HTTP daemon + Router + Reverse-Tunnel Hub (backward-compatible with agent.py):
@@ -620,7 +620,7 @@ def execute_local_action(action: str, params: dict) -> dict:
             raise FileNotFoundError(f"not found: {p}")
         size = p.stat().st_size
         if size > SMALL_FILE_LIMIT:
-            raise ValueError(f"file is {size} bytes (> 8 MiB); use /download")
+            raise ValueError(f"file is {size} bytes (> 8 MiB); use :download")
         data = p.read_bytes()
         return {"path": str(p), "size": size, "data_b64": base64.b64encode(data).decode("ascii")}
 
@@ -1928,10 +1928,10 @@ def run_stdio_hop() -> int:
 
 
 # ---------------------------------------------------------------------------
-# CLI Helpers & Slash-Command Dispatcher (One-Shot Bot & Human Friendly)
+# CLI Helpers & Colon-Command Dispatcher (One-Shot Bot & Human Friendly)
 # ---------------------------------------------------------------------------
 
-_SLASH_COMMANDS = {
+_MGMT_COMMANDS = {
     "help",
     "id",
     "whoami",
@@ -1965,24 +1965,10 @@ _SLASH_COMMANDS = {
 }
 
 
-def _detect_slash_command(arg0: str) -> str | None:
-    """Return normalized slash command name (without leading '/') or None for normal commands.
-
-    - `//nodes` -> `nodes` (Git Bash / MSYS escape)
-    - `/nodes` -> `nodes` (any single-segment `/word` without a second `/` like `/bin/ls`)
-    - `C:/Program Files/Git/nodes` -> `nodes` (MSYS auto-expanded path on Windows)
-    """
-    if not arg0:
-        return None
-    if arg0.startswith("//") and "/" not in arg0[2:]:
-        return arg0[2:].lower()
-    if arg0.startswith("/") and "/" not in arg0[1:]:
+def _detect_mgmt_command(arg0: str) -> str | None:
+    """Return normalized management command name (without leading ':') or None for normal commands."""
+    if arg0 and arg0.startswith(":") and len(arg0) > 1:
         return arg0[1:].lower()
-    norm = arg0.replace("\\", "/")
-    if "/Git/" in norm:
-        tail = norm.rsplit("/Git/", 1)[-1].lower()
-        if tail in _SLASH_COMMANDS:
-            return tail
     return None
 
 
@@ -2147,44 +2133,43 @@ def _print_help() -> None:
 Usage:
   rmcp <command...>                       Run shell command on active remote node (cwd preserved)
   rmcp --to <node> <command...>           Run one-shot command on <node> without switching active
-  rmcp /<mgmt-cmd> [args...]              Execute rmcp mesh/node management command
-                                          (Tip: in Git Bash on Windows, use //nodes if MSYS expands /)
+  rmcp :<mgmt-cmd> [args...]              Execute rmcp mesh/node management command
 
 Mesh & Routing Commands:
-  /id                                     Show this machine's deterministic node_id & alias
-  /nodes | /peers | /routes [target]      Show local (or remote node's) known peers & cached routes
-  /connect <alias> <endpoint> [options]   Connect & record a peer edge (SSH preferred, HTTP fallback)
+  :id                                     Show this machine's deterministic node_id & alias
+  :nodes | :peers | :routes [target]      Show local (or remote node's) known peers & cached routes
+  :connect <alias> <endpoint> [options]   Connect & record a peer edge (SSH preferred, HTTP fallback)
       Endpoints:  ssh://user@host[:port]  |  user@host  |  http://host:port
       Options:    --bootstrap             Copy rmcp.py to SSH host (~/.rmcp/rmcp.py) automatically
                   --token <tok>           Shared token for HTTP endpoint
                   --via <hop_node>        Ask <hop_node> to connect using ITS keys/network (multi-hop!)
                   --port <ssh_port>       Override SSH port
                   --remote-path <path>    Custom remote path for rmcp.py on SSH host
-  /disconnect <alias> [--via <hop_node>]  Remove a recorded peer edge
-  /use <target>                           Switch active target node (alias, node_id, or multi-hop peer)
-  /ping [target]                          Probe target and display hop-by-hop `via` path
-  /env [target]                           Inspect OS, shells, Python, disk & environment on target
+  :disconnect <alias> [--via <hop_node>]  Remove a recorded peer edge
+  :use <target>                           Switch active target node (alias, node_id, or multi-hop peer)
+  :ping [target]                          Probe target and display hop-by-hop `via` path
+  :env [target]                           Inspect OS, shells, Python, disk & environment on target
 
 Daemon, Reverse-Tunnel & Self-Healing Commands (for SSH-less / NAT hosts):
-  /listen [--port 7777] [--host 0.0.0.0] [--token T] [--daemon] [--watchdog]
+  :listen [--port 7777] [--host 0.0.0.0] [--token T] [--daemon] [--watchdog]
                                           Listen as encrypted HTTP node + reverse-tunnel hub
-  /dial <hub_url> --token <T> [--alias A] [--daemon] [--watchdog]
+  :dial <hub_url> --token <T> [--alias A] [--daemon] [--watchdog]
                                           Dial outbound reverse connection to a hub (no inbound port!)
-  /autostart [status|on|off] [--port 7777] [--dial <url> --token <T>] [--local]
+  :autostart [status|on|off] [--port 7777] [--dial <url> --token <T>] [--local]
                                           Configure boot auto-start + watchdog on target (or --local)
 
 Remote File & Process Commands (work across arbitrary multi-hop chains):
-  /pwd                                    Show tracked working directory for active target
-  /cd <dir>                               Change tracked working directory for active target
-  /read <remote_path>                     Print UTF-8 file from target (<= 8 MiB)
-  /write <remote_path> <content>          Atomically write text file on target
-  /edit <remote_path> <old> <new>         Replace unique occurrence of <old> with <new> on target
-  /upload <local_path> <remote_path>      Stream file to target with SHA-256 verification
-  /download <remote_path> <local_path>    Stream file from target with SHA-256 verification
-  /spawn <command> [--stdout <log_path>]  Start detached background process on target
-  /ps                                     List spawned background processes on target
-  /kill <pid> [TERM|KILL]                 Terminate a spawned process on target
-  /shutdown [--delay 1.0]                 Shut down a remote HTTP/dial daemon cleanly
+  :pwd                                    Show tracked working directory for active target
+  :cd <dir>                               Change tracked working directory for active target
+  :read <remote_path>                     Print UTF-8 file from target (<= 8 MiB)
+  :write <remote_path> <content>          Atomically write text file on target
+  :edit <remote_path> <old> <new>         Replace unique occurrence of <old> with <new> on target
+  :upload <local_path> <remote_path>      Stream file to target with SHA-256 verification
+  :download <remote_path> <local_path>    Stream file from target with SHA-256 verification
+  :spawn <command> [--stdout <log_path>]  Start detached background process on target
+  :ps                                     List spawned background processes on target
+  :kill <pid> [TERM|KILL]                 Terminate a spawned process on target
+  :shutdown [--delay 1.0]                 Shut down a remote HTTP/dial daemon cleanly
 """
     )
 
@@ -2215,9 +2200,9 @@ def _pop_flag(args: list[str], flag: str, has_value: bool = False) -> tuple[bool
     return found, val, rest
 
 
-def _handle_slash_command(cmd: str, args: list[str], explicit_to: str = "") -> int:
-    if cmd not in _SLASH_COMMANDS:
-        sys.stderr.write(f"[rmcp] unknown management command '/{cmd}'. Run `rmcp /help` for usage.\n")
+def _handle_mgmt_command(cmd: str, args: list[str], explicit_to: str = "") -> int:
+    if cmd not in _MGMT_COMMANDS:
+        sys.stderr.write(f"[rmcp] unknown management command ':{cmd}'. Run `rmcp :help` for usage.\n")
         return 2
 
     if cmd == "help":
@@ -2280,7 +2265,7 @@ def _handle_slash_command(cmd: str, args: list[str], explicit_to: str = "") -> i
         ssh_port = int(port_s) if port_s else None
 
         if len(args) < 2:
-            sys.stderr.write("Usage: rmcp /connect <alias> <endpoint> [--bootstrap] [--token T] [--via <hop>]\n")
+            sys.stderr.write("Usage: rmcp :connect <alias> <endpoint> [--bootstrap] [--token T] [--via <hop>]\n")
             return 2
         alias, endpoint = args[0], args[1]
         hop = via_hop or explicit_to
@@ -2299,10 +2284,10 @@ def _handle_slash_command(cmd: str, args: list[str], explicit_to: str = "") -> i
                 timeout=90.0,
             )
             if not resp.get("ok"):
-                sys.stderr.write(f"[rmcp] remote /connect via '{hop}' failed: {resp.get('error')}\n")
+                sys.stderr.write(f"[rmcp] remote :connect via '{hop}' failed: {resp.get('error')}\n")
                 return 1
             info = resp.get("result") or {}
-            # Cache route locally so `rmcp /use <alias>` or `rmcp --to <alias>` works immediately!
+            # Cache route locally so `rmcp :use <alias>` or `rmcp --to <alias>` works immediately!
             first_hop = hop if hop in state["peers"] else (state["routes"].get(hop, {}).get("next_hop") or hop)
             with _STATE_LOCK:
                 st = load_router_state()
@@ -2336,20 +2321,20 @@ def _handle_slash_command(cmd: str, args: list[str], explicit_to: str = "") -> i
             print(json.dumps({"ok": True, "active": alias, "peer": info}, indent=2, ensure_ascii=False))
             return 0
         except Exception as e:
-            sys.stderr.write(f"[rmcp] /connect failed: {e}\n")
+            sys.stderr.write(f"[rmcp] :connect failed: {e}\n")
             return 1
 
     if cmd in ("disconnect", "rm"):
         _, via_hop, args = _pop_flag(args, "--via", True)
         if not args:
-            sys.stderr.write("Usage: rmcp /disconnect <alias> [--via <hop>]\n")
+            sys.stderr.write("Usage: rmcp :disconnect <alias> [--via <hop>]\n")
             return 2
         alias = args[0]
         hop = via_hop or explicit_to
         if hop and not _is_local_target(hop, state):
             resp = send_action(hop, "peer_remove", {"alias": alias})
             if not resp.get("ok"):
-                sys.stderr.write(f"[rmcp] /disconnect via '{hop}' failed: {resp.get('error')}\n")
+                sys.stderr.write(f"[rmcp] :disconnect via '{hop}' failed: {resp.get('error')}\n")
                 return 1
             print(json.dumps(resp.get("result"), indent=2, ensure_ascii=False))
             return 0
@@ -2430,7 +2415,7 @@ def _handle_slash_command(cmd: str, args: list[str], explicit_to: str = "") -> i
         _, alias_s, args = _pop_flag(args, "--alias", True)
         _, via_hop, args = _pop_flag(args, "--via", True)
         if not args or not tok_s:
-            sys.stderr.write("Usage: rmcp /dial <hub_url> --token <token> [--alias <name>] [--daemon] [--watchdog]\n")
+            sys.stderr.write("Usage: rmcp :dial <hub_url> --token <token> [--alias <name>] [--daemon] [--watchdog]\n")
             return 2
         hub_url = args[0]
         child_args = ["--dial", hub_url, "--token", tok_s]
@@ -2444,7 +2429,7 @@ def _handle_slash_command(cmd: str, args: list[str], explicit_to: str = "") -> i
             rcmd = subprocess.list2cmdline([ "python", "~/.rmcp/rmcp.py", *child_args ])
             resp = send_action(hop, "spawn", {"command": rcmd})
             if not resp.get("ok"):
-                sys.stderr.write(f"[rmcp] remote /dial failed: {resp.get('error')}\n")
+                sys.stderr.write(f"[rmcp] remote :dial failed: {resp.get('error')}\n")
                 return 1
             print(json.dumps(resp.get("result"), indent=2, ensure_ascii=False))
             return 0
@@ -2489,7 +2474,7 @@ def _handle_slash_command(cmd: str, args: list[str], explicit_to: str = "") -> i
             },
         )
         if not resp.get("ok"):
-            sys.stderr.write(f"[rmcp] /autostart failed on '{target}': {resp.get('error')}\n")
+            sys.stderr.write(f"[rmcp] :autostart failed on '{target}': {resp.get('error')}\n")
             return 1
         print(json.dumps(resp.get("result"), indent=2, ensure_ascii=False))
         return 0
@@ -2498,7 +2483,7 @@ def _handle_slash_command(cmd: str, args: list[str], explicit_to: str = "") -> i
         tgt = explicit_to or (args[0] if args else target)
         resp = send_action(tgt, cmd, {})
         if not resp.get("ok"):
-            sys.stderr.write(f"[rmcp] /{cmd} failed on '{tgt}': {resp.get('error')}\n")
+            sys.stderr.write(f"[rmcp] :{cmd} failed on '{tgt}': {resp.get('error')}\n")
             return 1
         print(json.dumps(resp, indent=2, ensure_ascii=False))
         return 0
@@ -2510,7 +2495,7 @@ def _handle_slash_command(cmd: str, args: list[str], explicit_to: str = "") -> i
             return 0
         resp = send_action(target, "ping", {})
         if not resp.get("ok"):
-            sys.stderr.write(f"[rmcp] /pwd failed on '{target}': {resp.get('error')}\n")
+            sys.stderr.write(f"[rmcp] :pwd failed on '{target}': {resp.get('error')}\n")
             return 1
         cwd = (resp.get("result") or {}).get("cwd", "")
         print(cwd)
@@ -2521,7 +2506,7 @@ def _handle_slash_command(cmd: str, args: list[str], explicit_to: str = "") -> i
         cur_cwd = state.get("cwds", {}).get(target)
         resp = send_action(target, "cd", {"cwd": cur_cwd, "path": path_arg})
         if not resp.get("ok"):
-            sys.stderr.write(f"[rmcp] /cd failed on '{target}': {resp.get('error')}\n")
+            sys.stderr.write(f"[rmcp] :cd failed on '{target}': {resp.get('error')}\n")
             return 1
         new_cwd = (resp.get("result") or {}).get("cwd", "")
         with _STATE_LOCK:
@@ -2533,11 +2518,11 @@ def _handle_slash_command(cmd: str, args: list[str], explicit_to: str = "") -> i
 
     if cmd == "read":
         if not args:
-            sys.stderr.write("Usage: rmcp /read <remote_path>\n")
+            sys.stderr.write("Usage: rmcp :read <remote_path>\n")
             return 2
         resp = send_action(target, "read", {"path": args[0]})
         if not resp.get("ok"):
-            sys.stderr.write(f"[rmcp] /read failed on '{target}': {resp.get('error')}\n")
+            sys.stderr.write(f"[rmcp] :read failed on '{target}': {resp.get('error')}\n")
             return 1
         raw = base64.b64decode((resp.get("result") or {}).get("data_b64", ""))
         sys.stdout.buffer.write(raw)
@@ -2546,7 +2531,7 @@ def _handle_slash_command(cmd: str, args: list[str], explicit_to: str = "") -> i
 
     if cmd == "write":
         if len(args) < 2:
-            sys.stderr.write("Usage: rmcp /write <remote_path> <content>\n")
+            sys.stderr.write("Usage: rmcp :write <remote_path> <content>\n")
             return 2
         content = " ".join(args[1:]).encode("utf-8")
         resp = send_action(
@@ -2555,14 +2540,14 @@ def _handle_slash_command(cmd: str, args: list[str], explicit_to: str = "") -> i
             {"path": args[0], "data_b64": base64.b64encode(content).decode("ascii")},
         )
         if not resp.get("ok"):
-            sys.stderr.write(f"[rmcp] /write failed on '{target}': {resp.get('error')}\n")
+            sys.stderr.write(f"[rmcp] :write failed on '{target}': {resp.get('error')}\n")
             return 1
         print(json.dumps(resp.get("result"), indent=2, ensure_ascii=False))
         return 0
 
     if cmd == "edit":
         if len(args) < 3:
-            sys.stderr.write("Usage: rmcp /edit <remote_path> <old_text> <new_text>\n")
+            sys.stderr.write("Usage: rmcp :edit <remote_path> <old_text> <new_text>\n")
             return 2
         resp = send_action(
             target,
@@ -2570,27 +2555,27 @@ def _handle_slash_command(cmd: str, args: list[str], explicit_to: str = "") -> i
             {"path": args[0], "old_text": args[1], "new_text": args[2]},
         )
         if not resp.get("ok"):
-            sys.stderr.write(f"[rmcp] /edit failed on '{target}': {resp.get('error')}\n")
+            sys.stderr.write(f"[rmcp] :edit failed on '{target}': {resp.get('error')}\n")
             return 1
         print(json.dumps(resp.get("result"), indent=2, ensure_ascii=False))
         return 0
 
     if cmd == "upload":
         if len(args) < 2:
-            sys.stderr.write("Usage: rmcp /upload <local_path> <remote_path>\n")
+            sys.stderr.write("Usage: rmcp :upload <local_path> <remote_path>\n")
             return 2
         return _cli_upload(target, args[0], args[1])
 
     if cmd == "download":
         if len(args) < 2:
-            sys.stderr.write("Usage: rmcp /download <remote_path> <local_path>\n")
+            sys.stderr.write("Usage: rmcp :download <remote_path> <local_path>\n")
             return 2
         return _cli_download(target, args[0], args[1])
 
     if cmd in ("ps", "proclist"):
         resp = send_action(target, "list", {})
         if not resp.get("ok"):
-            sys.stderr.write(f"[rmcp] /ps failed on '{target}': {resp.get('error')}\n")
+            sys.stderr.write(f"[rmcp] :ps failed on '{target}': {resp.get('error')}\n")
             return 1
         print(json.dumps(resp.get("result"), indent=2, ensure_ascii=False))
         return 0
@@ -2599,7 +2584,7 @@ def _handle_slash_command(cmd: str, args: list[str], explicit_to: str = "") -> i
         _, out_s, args = _pop_flag(args, "--stdout", True)
         _, err_s, args = _pop_flag(args, "--stderr", True)
         if not args:
-            sys.stderr.write("Usage: rmcp /spawn <command...> [--stdout <path>]\n")
+            sys.stderr.write("Usage: rmcp :spawn <command...> [--stdout <path>]\n")
             return 2
         cmd_str = _format_passthrough_cmd(args, _is_target_windows(target, state))
         cur_cwd = state.get("cwds", {}).get(target)
@@ -2609,19 +2594,19 @@ def _handle_slash_command(cmd: str, args: list[str], explicit_to: str = "") -> i
             {"command": cmd_str, "cwd": cur_cwd, "stdout": out_s or None, "stderr": err_s or None},
         )
         if not resp.get("ok"):
-            sys.stderr.write(f"[rmcp] /spawn failed on '{target}': {resp.get('error')}\n")
+            sys.stderr.write(f"[rmcp] :spawn failed on '{target}': {resp.get('error')}\n")
             return 1
         print(json.dumps(resp.get("result"), indent=2, ensure_ascii=False))
         return 0
 
     if cmd == "kill":
         if not args:
-            sys.stderr.write("Usage: rmcp /kill <pid> [TERM|KILL]\n")
+            sys.stderr.write("Usage: rmcp :kill <pid> [TERM|KILL]\n")
             return 2
         sig = args[1] if len(args) >= 2 else "TERM"
         resp = send_action(target, "kill", {"pid": int(args[0]), "signal": sig})
         if not resp.get("ok"):
-            sys.stderr.write(f"[rmcp] /kill failed on '{target}': {resp.get('error')}\n")
+            sys.stderr.write(f"[rmcp] :kill failed on '{target}': {resp.get('error')}\n")
             return 1
         print(json.dumps(resp.get("result"), indent=2, ensure_ascii=False))
         return 0
@@ -2631,7 +2616,7 @@ def _handle_slash_command(cmd: str, args: list[str], explicit_to: str = "") -> i
         delay = float(delay_s) if delay_s else 1.0
         resp = send_action(target, "shutdown", {"delay": delay})
         if not resp.get("ok"):
-            sys.stderr.write(f"[rmcp] /shutdown failed on '{target}': {resp.get('error')}\n")
+            sys.stderr.write(f"[rmcp] :shutdown failed on '{target}': {resp.get('error')}\n")
             return 1
         print(json.dumps(resp.get("result"), indent=2, ensure_ascii=False))
         return 0
@@ -2654,10 +2639,10 @@ def cli_main(argv: list[str] | None = None) -> int:
         return 0
 
     if raw[0] == "--listen":
-        return _handle_slash_command("listen", raw[1:])
+        return _handle_mgmt_command("listen", raw[1:])
 
     if raw[0] == "--dial":
-        return _handle_slash_command("dial", raw[1:])
+        return _handle_mgmt_command("dial", raw[1:])
 
     if raw[0] in ("-h", "--help"):
         _print_help()
@@ -2695,10 +2680,10 @@ def cli_main(argv: list[str] | None = None) -> int:
         _print_help()
         return 0
 
-    # 3. Slash management command vs normal shell command pass-through
-    slash_cmd = _detect_slash_command(rem[0])
-    if slash_cmd is not None:
-        return _handle_slash_command(slash_cmd, rem[1:], explicit_to=explicit_to)
+    # 3. Colon management command (`:use`, `:nodes`, ...) vs normal shell command pass-through
+    mgmt_cmd = _detect_mgmt_command(rem[0])
+    if mgmt_cmd is not None:
+        return _handle_mgmt_command(mgmt_cmd, rem[1:], explicit_to=explicit_to)
 
     state = load_router_state()
     target = _resolve_active_target(explicit_to, state)
