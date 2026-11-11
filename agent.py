@@ -826,7 +826,11 @@ class Handler(BaseHTTPRequestHandler):
     server_version = f"remote-agent/{VERSION}"
 
     def log_message(self, format: str, *args) -> None:  # noqa: A002
-        sys.stderr.write(f"[agent] {self.client_address[0]} - {format % args}\n")
+        # pythonw.exe deliberately has no console streams.  Auto-starting the
+        # agent with it must not turn HTTP response logging into a request
+        # failure after the socket has already accepted the connection.
+        if sys.stderr is not None:
+            sys.stderr.write(f"[agent] {self.client_address[0]} - {format % args}\n")
 
     def _dispatch(self, method: str) -> None:
         # Strip query string for route matching (e.g. /download?path=...).

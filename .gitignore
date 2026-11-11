@@ -1,5 +1,7 @@
 # Secrets / local config — never commit
 hosts.json
+router.json
+seen_pkts.json
 agent.token
 *.token
 
