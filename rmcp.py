@@ -1850,16 +1850,18 @@ def _fallback_legacy_agent_http(peer: dict, env: dict, timeout: float = 120.0) -
 
     if action == "exec":
         r = _legacy_http_exec_ndjson(base, tok, params, timeout=timeout)
+        r["via"] = via
+        r["node_id"] = peer.get("alias")
         if r.get("ok"):
-            r["via"] = via
-            r["node_id"] = peer.get("alias")
+            r["reached_dst"] = True
         return r
 
     if action in ("read", "write", "spawn", "kill", "shutdown"):
         code, res = _http_request_json(base + f"/{action}", "POST", tok, params, timeout=timeout)
+        reached = code in (200, 400, 404, 500)
         if code == 200 and isinstance(res, dict):
-            return {"ok": True, "node_id": peer.get("alias"), "via": via, "result": res}
-        return {"ok": False, "error": f"/{action} {code}: {res}"}
+            return {"ok": True, "node_id": peer.get("alias"), "via": via, "result": res, "reached_dst": True}
+        return {"ok": False, "error": f"/{action} {code}: {res}", "reached_dst": reached, "via": via}
 
     if action == "upload_chunk":
         if params.get("offset", 0) == 0 and params.get("finalize"):
@@ -1986,13 +1988,16 @@ def _learn_route(dst: str, next_hop_alias: str, resp: dict) -> None:
         state = load_topology_state()
         if dst in state["peers"]:
             return
-        prev_plat = (state["routes"].get(dst) or {}).get("platform", "")
+        prev_route = state["routes"].get(dst) or {}
+        prev_plat = prev_route.get("platform", "")
+        is_explicit = prev_route.get("explicit", False)
         state["routes"][dst] = {
             "next_hop": next_hop_alias,
             "path": resp.get("via") or [],
             "node_id": resp.get("node_id", ""),
             "platform": plat or prev_plat,
             "updated_at": int(time.time()),
+            "explicit": is_explicit,
         }
         save_topology_state(state)
 
