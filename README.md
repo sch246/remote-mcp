@@ -22,6 +22,8 @@
      - 有 SSH 时走 `ssh --stdio-hop` / `--stdio-loop` 管道传输 Base64 帧（交互模式与大文件分块传输自动保持全链路多跳 SSH 管道常驻热复用，免除重复握手耗时），彻底绕过 `bash`/`cmd.exe` 多跳引号转义地狱与 GBK 乱码；支持 `--bootstrap` 自动把单文件 `rmcp.py` 流式部署到目标机 `~/.rmcp/rmcp.py`；跳板机还能用**自己的 SSH Key 或内网权限**连接下一跳（`--via <跳板>`）。
      - 无 SSH 时可运行 `--listen` 监听端口并生成 token（`BLAKE2b-CTR + HMAC-SHA256` 认证加密），兼容旧版 `agent.py` v0.4。
      - 无公网 IP / 防火墙禁入站时可运行 `--dial <hub_url> --token <T>` 主动向外长轮询连入中枢节点，全网即可反向路由访问该内网节点。
+     - **蓝绿多端口自升级 + 主端口回收（`:upgrade`）**：运行时计算 LF 归一化源码哈希（`code_hash`，无自引用递归问题）；升级 HTTP 守护节点时先在空闲候选端口（默认 `7778,7779,7780`）拉起新实例并完成外部端到端探活校验，确认无误后才停机旧实例、瞬间回收原主端口（如 `7777`）并释放候选端口，失败则零中断回滚；支持 `--standby-if-busy` 兼容外部批处理守护脚本。
+     - **两档零知识陌生人盲中继（`--allow-relay` / `:relay` / `:connect --relay`）**：当中转机显式开放盲中继后，调用方**无需知晓中转机密钥**，仅凭目标机密钥即可建立端到端认证加密链路（`e2e` 信封绑定 `pkt_id`，中转机零解密且绝不注入自身已存凭据）。提供两档策略：`peers`（仅限中转机已登记邻居与 `--dial` 反向节点）与 `private`/自定义 CIDR（允许指定白名单网段与端口直达未登记内网节点，内置回环/链路本地/云元数据 SSRF 硬拦截）。
      - 支持 `--watchdog` 崩溃自愈守护与 `:autostart on` 开机自启（Windows 写入用户 `Startup` 目录无窗口 `.vbs`，无需管理员权限；Linux 写入用户 `crontab @reboot`）。
 2. **`server.py` + `agent.py`（MCP 服务器 + 轻量 HTTP Agent）** —— 供 Claude Code 等 MCP 客户端通过 14 个 `remote_*` 工具调用远端主机。
 
@@ -51,6 +53,16 @@ python rmcp.py :connect box7 http://192.168.50.20:7777 --token <TOKEN> --via win
 
 # D. 内网隔离机（无 SSH 且无法开入站端口）：主动反向连入任意监听中的 Hub 节点
 python rmcp.py :dial http://10.12.23.6:7777 --token <HUB_TOKEN> --alias nat-pc --watchdog --daemon
+
+# E. 零知识陌生人盲中继：中转机开放策略后，调用方无需中转机密钥，仅凭目标机密钥直连！
+python rmcp.py --to relay-hub :relay peers                           # 一档：仅允许访问中转机已登记邻居 / --dial 节点
+python rmcp.py --to relay-hub :relay 192.168.88.0/24 --ports 7777,7778  # 二档：开放指定内网网段与端口
+python rmcp.py :connect nat-pc --token <TARGET_TOKEN> --relay http://10.12.23.6:7777
+python rmcp.py :connect cam188 http://192.168.88.188:7777 --token <TARGET_TOKEN> --relay http://10.12.23.6:7777
+
+# F. 蓝绿无损自升级（候选端口端到端验活 -> 旧进程退出 -> 回收 7777 主端口）
+python rmcp.py :upgrade box7
+python rmcp.py :upgrade --all
 ```
 
 ### 2. 日常使用（对单次调用 Bot 完全友好）
@@ -95,10 +107,12 @@ python rmcp.py :repl nat-pc                   # 或在终端直接运行 python 
 | `:id [--alias <名>]` | 查看本机确定性 `node_id`、别名与当前调用源头（`caller`） |
 | `:sessions [--clear\|--clear-all]` | 查看或清理本机各调用源头（目录/Agent）的独立会话状态 |
 | `:nodes`（或 `:peers` / `:routes`） | 查看本机或指定节点的邻居表、缓存路由与反向在线会话 |
-| `:connect <别名> <地址> [--bootstrap] [--token T] [--via <跳板>]` | 建立 SSH 或 HTTP 边并记录拓扑 |
+| `:connect <别名> [地址] [--bootstrap] [--token T] [--via <跳板>] [--relay <中转>]` | 建立 SSH、HTTP 或零知识盲中继（`--relay`）连接 |
 | `:disconnect <别名> [--via <跳板>]` | 删除已记录的邻居边与关联缓存路由 |
 | `:use <目标>`（或 `:to <目标>`） | 探测可达性并切换默认穿透目标（`:use self` 切回本机） |
-| `:listen [--port 7777] [--token T] [--daemon] [--watchdog]` | 启动加密 HTTP 路由监听 + 反向连接 Hub |
+| `:upgrade [目标\|--all] [--ports 7778,7779,7780] [--force]` | 蓝绿多端口无损自升级并自动回收主端口（先连上新实例再关旧实例） |
+| `:relay [status\|off\|peers\|private\|<CIDR,...>] [--ports ...] [--local]` | 查看或配置两档陌生人零知识盲中继策略 |
+| `:listen [--port 7777] [--token T] [--allow-relay ...] [--standby-if-busy] [--daemon] [--watchdog]` | 启动加密 HTTP 路由监听 + 反向连接 Hub |
 | `:dial <hub_url> --token <T> [--alias A] [--daemon] [--watchdog]` | 主动发起反向长轮询隧道接入 Hub |
 | `:autostart [status\|on\|off] [--port P] [--dial URL --token T] [--local]` | 管理目标机（或 `--local` 本机）开机自启 |
 | `:ping [目标]` / `:env [目标]` | 探测路由跳数路径 / 查看目标系统、Shell、Python 与磁盘快照 |

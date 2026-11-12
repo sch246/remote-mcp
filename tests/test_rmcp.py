@@ -33,6 +33,8 @@ def run_cli(
     extra_env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
+    env.pop("REMOTE_AGENT_TOKEN", None)
+    env.pop("PI_REMOTE_AGENT_TOKEN", None)
     env["REMOTE_MCP_STATE_DIR"] = str(state_dir)
     env["RMCP_STATE_DIR"] = str(state_dir)
     if alias:
@@ -658,6 +660,433 @@ class CallerSessionIsolationAndOriginTest(unittest.TestCase):
                 shared_state, "--to", "nodeC", ":kill", str(sp_pid), "KILL", cwd=bot_subdir, extra_env=bot_env
             )
             self.assertEqual(kl.returncode, 0, kl.stderr)
+
+
+class CodeHashAndExclusivePortTest(unittest.TestCase):
+    def test_code_hash_crlf_normalization_and_exclusive_bind(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p_lf = Path(tmp) / "a_lf.py"
+            p_crlf = Path(tmp) / "a_crlf.py"
+            src_lf = b"#!/usr/bin/env python3\nprint('hello')\n"
+            src_crlf = b"#!/usr/bin/env python3\r\nprint('hello')\r\n"
+            p_lf.write_bytes(src_lf)
+            p_crlf.write_bytes(src_crlf)
+            self.assertEqual(rmcp.compute_code_hash(p_lf), rmcp.compute_code_hash(p_crlf))
+            self.assertEqual(len(rmcp.CODE_HASH), 12)
+
+        port = _pick_free_port()
+        srv = rmcp._bind_listener_port("127.0.0.1", port, "tok-test")
+        try:
+            self.assertIsNotNone(srv)
+            self.assertIn(port, rmcp.get_active_listen_ports())
+            self.assertFalse(rmcp._can_bind_exclusive("127.0.0.1", port))
+        finally:
+            self.assertTrue(rmcp._close_listener_port(port))
+        self.assertTrue(rmcp._can_bind_exclusive("127.0.0.1", port))
+
+
+class BlueGreenUpgradeAndReclaimTest(unittest.TestCase):
+    def test_blue_green_upgrade_rapid_switches_and_rollback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            cli_dir = base / "cli"
+            srv_state = base / "srv_state"
+            install_dir = base / "srv_install"
+            install_dir.mkdir(parents=True, exist_ok=True)
+
+            primary_port = _pick_free_port()
+            cand1 = _pick_free_port()
+            cand2 = _pick_free_port()
+            cand3 = _pick_free_port()
+            cand_csv = f"{cand1},{cand2},{cand3}"
+            srv_tok = "upgrade-secret-token-888"
+
+            # Create an "older" v0.7.5 copy of rmcp.py with a distinct CODE_HASH
+            raw_src = Path(RMCP_SCRIPT).read_text(encoding="utf-8")
+            old_src = raw_src.replace('VERSION = "0.8.0"', 'VERSION = "0.7.5"', 1)
+            agent_py = install_dir / "agent.py"
+            agent_py.write_text(old_src, encoding="utf-8")
+            (install_dir / "agent.token").write_text(srv_tok, encoding="utf-8")
+            old_hash = rmcp.compute_code_hash(agent_py)
+            self.assertNotEqual(old_hash, rmcp.CODE_HASH)
+
+            srv_env = os.environ.copy()
+            srv_env.pop("REMOTE_AGENT_TOKEN", None)
+            srv_env.pop("PI_REMOTE_AGENT_TOKEN", None)
+            srv_env["REMOTE_MCP_STATE_DIR"] = str(srv_state)
+            srv_env["RMCP_STATE_DIR"] = str(srv_state)
+            blue_proc = subprocess.Popen(
+                [sys.executable, str(agent_py), "--listen", "--host", "127.0.0.1", "--port", str(primary_port)],
+                cwd=str(install_dir),
+                env=srv_env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+            current_pid = blue_proc.pid
+            try:
+                # Wait for Blue (v0.7.5) to start
+                for _ in range(40):
+                    c, r = rmcp._http_request_json(f"http://127.0.0.1:{primary_port}/ping", "GET", "")
+                    if c == 200:
+                        break
+                    time.sleep(0.1)
+
+                conn = run_cli(
+                    cli_dir,
+                    ":connect",
+                    "winbox",
+                    f"http://127.0.0.1:{primary_port}",
+                    "--token",
+                    srv_tok,
+                    "--ports",
+                    cand_csv,
+                )
+                self.assertEqual(conn.returncode, 0, conn.stderr)
+
+                # 1. Rollback safety test: occupy cand_occupied with a dummy plain TCP socket so Green fails to bind!
+                import socket as _sock
+
+                blocker = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
+                blocker.setsockopt(_sock.SOL_SOCKET, _sock.SO_REUSEADDR, 1)
+                blocker.bind(("127.0.0.1", 0))
+                blocker.listen(1)
+                blocked_port = blocker.getsockname()[1]
+                try:
+                    bad_upg = run_cli(cli_dir, ":upgrade", "winbox", "--ports", str(blocked_port))
+                    self.assertNotEqual(bad_upg.returncode, 0)
+                    # Verify Blue on primary_port is 100% untouched!
+                    p_after_fail = json.loads(run_cli(cli_dir, ":ping", "winbox").stdout)["result"]
+                    self.assertEqual(p_after_fail["pid"], blue_proc.pid)
+                    self.assertEqual(p_after_fail["version"], "0.7.5")
+                finally:
+                    blocker.close()
+
+                # 2. Start continuous background ping traffic during upgrades to verify zero dropped requests!
+                stop_traffic = threading.Event()
+                traffic_failures: list[str] = []
+                traffic_ok_count = 0
+
+                def _traffic_worker() -> None:
+                    nonlocal traffic_ok_count
+                    while not stop_traffic.is_set():
+                        pr = run_cli(cli_dir, ":ping", "winbox")
+                        if pr.returncode != 0:
+                            traffic_failures.append(pr.stderr or pr.stdout)
+                        else:
+                            traffic_ok_count += 1
+                        time.sleep(0.08)
+
+                t_worker = threading.Thread(target=_traffic_worker, daemon=True)
+                t_worker.start()
+
+                try:
+                    # 3. Initial Blue-Green upgrade: 0.7.5 -> 0.8.0 + reclaim primary_port!
+                    u1 = run_cli(cli_dir, ":upgrade", "winbox", "--ports", cand_csv)
+                    self.assertEqual(u1.returncode, 0, u1.stderr + u1.stdout)
+                    u1_doc = json.loads(u1.stdout)
+                    self.assertEqual(u1_doc["status"], "upgraded")
+                    self.assertEqual(u1_doc["old_version"], "0.7.5")
+                    self.assertEqual(u1_doc["new_version"], rmcp.VERSION)
+                    self.assertEqual(u1_doc["new_hash"], rmcp.CODE_HASH)
+                    self.assertTrue(u1_doc["reclaimed_primary_port"])
+                    self.assertNotEqual(u1_doc["green_pid"], blue_proc.pid)
+                    current_pid = u1_doc["green_pid"]
+                    self.assertTrue((install_dir / "agent.py.bak").exists())
+                    self.assertEqual(rmcp.compute_code_hash(agent_py), rmcp.CODE_HASH)
+
+                    # 4. Idempotent check without --force -> status == "up_to_date"
+                    u_noop = json.loads(run_cli(cli_dir, ":upgrade", "winbox", "--ports", cand_csv).stdout)
+                    self.assertEqual(u_noop["status"], "up_to_date")
+                    self.assertEqual(u_noop["pid"], current_pid)
+
+                    # 5. Rapid back-to-back forced upgrades (x3 in tight sequence)!
+                    seen_pids = {blue_proc.pid, current_pid}
+                    for round_idx in range(3):
+                        ur = run_cli(cli_dir, ":upgrade", "winbox", "--ports", cand_csv, "--force")
+                        self.assertEqual(ur.returncode, 0, f"round {round_idx} failed: {ur.stderr}\n{ur.stdout}")
+                        ur_doc = json.loads(ur.stdout)
+                        self.assertEqual(ur_doc["status"], "upgraded")
+                        self.assertTrue(ur_doc["reclaimed_primary_port"])
+                        self.assertEqual(ur_doc["primary_port"], primary_port)
+                        self.assertNotIn(ur_doc["green_pid"], seen_pids)
+                        seen_pids.add(ur_doc["green_pid"])
+                        current_pid = ur_doc["green_pid"]
+                finally:
+                    stop_traffic.set()
+                    t_worker.join(timeout=5.0)
+
+                self.assertGreater(traffic_ok_count, 5)
+                self.assertEqual(traffic_failures, [], f"Dropped traffic during rapid upgrades: {traffic_failures}")
+
+                # Wait 0.5s for final candidate port delayed release, then confirm ONLY primary_port is held!
+                time.sleep(0.5)
+                final_ping = json.loads(run_cli(cli_dir, ":ping", "winbox").stdout)["result"]
+                self.assertEqual(final_ping["pid"], current_pid)
+                self.assertEqual(final_ping["listen_ports"], [primary_port])
+                for cp in (cand1, cand2, cand3):
+                    self.assertTrue(rmcp._can_bind_exclusive("127.0.0.1", cp), f"candidate port {cp} leaked!")
+            finally:
+                run_cli(cli_dir, "--to", "winbox", ":shutdown", "--delay", "0.05")
+                if blue_proc.poll() is None:
+                    blue_proc.kill()
+                    blue_proc.wait(timeout=3)
+
+
+class TwoTierBlindRelayTest(unittest.TestCase):
+    def test_two_tier_stranger_blind_relay_and_ssrf_guards(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            relay_dir = base / "relay"
+            tgt_http_dir = base / "tgt_http"
+            tgt_nat_dir = base / "tgt_nat"
+            unreg_dir = base / "unreg_http"
+            unreg_install = base / "unreg_install"
+            unreg_install.mkdir(parents=True, exist_ok=True)
+            stranger_dir = base / "stranger"
+
+            p_relay = _pick_free_port()
+            p_tgt = _pick_free_port()
+            p_unreg = _pick_free_port()
+            p_unreg_c1 = _pick_free_port()
+            p_unreg_c2 = _pick_free_port()
+
+            k_relay = "SECRET-RELAY-TOKEN-NEVER-SHARED"
+            k_tgt = "SECRET-TARGET-HTTP-TOKEN"
+            k_nat = "SECRET-TARGET-NAT-TOKEN"
+            k_unreg = "SECRET-UNREG-CIDR-TOKEN"
+
+            relay_url = f"http://127.0.0.1:{p_relay}"
+            tgt_url = f"http://127.0.0.1:{p_tgt}"
+            unreg_url = f"http://127.0.0.1:{p_unreg}"
+
+            # 1. Prepare SSRF unit checks (without RMCP_TEST_ALLOW_LOOPBACK_RELAY, loopback & link-local MUST fail!)
+            pol_all = {"mode": "cidr", "cidrs": ["0.0.0.0/0"], "ports": [7777, p_unreg]}
+            with self.assertRaises(PermissionError):
+                rmcp._validate_stranger_dst_url(f"http://127.0.0.1:{p_unreg}", pol_all)
+            with self.assertRaises(PermissionError):
+                rmcp._validate_stranger_dst_url("http://169.254.169.254:7777", pol_all)
+            with self.assertRaises(PermissionError):
+                rmcp._validate_stranger_dst_url("http://192.168.88.188:9999", pol_all)  # disallowed port
+
+            # 2. Launch Relay, Registered HTTP Target, Reverse-Tunnel NAT Target, and Unregistered v0.7.5 Target
+            def _spawn_daemon(st_dir: Path, script: str, args: list[str], extra: dict | None = None, cwd: Path | None = None):
+                e = os.environ.copy()
+                e.pop("REMOTE_AGENT_TOKEN", None)
+                e.pop("PI_REMOTE_AGENT_TOKEN", None)
+                e["REMOTE_MCP_STATE_DIR"] = str(st_dir)
+                e["RMCP_STATE_DIR"] = str(st_dir)
+                if extra:
+                    e.update(extra)
+                return subprocess.Popen(
+                    [sys.executable, script, *args],
+                    cwd=str(cwd) if cwd else None,
+                    env=e,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+
+            # Pre-seed NAT node's own agent.token so Stranger can address it E2E without K_relay!
+            tgt_nat_dir.mkdir(parents=True, exist_ok=True)
+            (tgt_nat_dir / "agent.token").write_text(k_nat, encoding="utf-8")
+
+            # Prepare Unregistered HTTP target as pre-0.8.0 (no `e2e` support) to verify downgrade rejection!
+            old_src = (
+                Path(RMCP_SCRIPT)
+                .read_text(encoding="utf-8")
+                .replace('VERSION = "0.8.0"', 'VERSION = "0.7.5"', 1)
+                .replace('was_e2e = "e2e" in env', "was_e2e = False", 1)
+            )
+            unreg_script = unreg_install / "agent.py"
+            unreg_script.write_text(old_src, encoding="utf-8")
+            (unreg_install / "agent.token").write_text(k_unreg, encoding="utf-8")
+
+            procs: list[subprocess.Popen] = []
+            try:
+                procs.append(
+                    _spawn_daemon(
+                        relay_dir,
+                        RMCP_SCRIPT,
+                        ["--listen", "--host", "127.0.0.1", "--port", str(p_relay), "--token", k_relay, "--alias", "relayBox"],
+                        extra={"RMCP_TEST_ALLOW_LOOPBACK_RELAY": "1"},
+                    )
+                )
+                procs.append(
+                    _spawn_daemon(
+                        tgt_http_dir,
+                        RMCP_SCRIPT,
+                        ["--listen", "--host", "127.0.0.1", "--port", str(p_tgt), "--token", k_tgt, "--alias", "innerHttp"],
+                    )
+                )
+                procs.append(
+                    _spawn_daemon(
+                        unreg_dir,
+                        str(unreg_script),
+                        ["--listen", "--host", "127.0.0.1", "--port", str(p_unreg)],
+                        cwd=unreg_install,
+                    )
+                )
+
+                for port_chk in (p_relay, p_tgt, p_unreg):
+                    for _ in range(40):
+                        c, _ = rmcp._http_request_json(f"http://127.0.0.1:{port_chk}/ping", "GET", "")
+                        if c == 200:
+                            break
+                        time.sleep(0.1)
+
+                # Start NAT reverse dialer into Relay (authenticated to Relay, registered as `innerNat`)
+                procs.append(
+                    _spawn_daemon(
+                        tgt_nat_dir,
+                        RMCP_SCRIPT,
+                        ["--dial", relay_url, "--token", k_relay, "--alias", "innerNat"],
+                    )
+                )
+
+                # Relay admin connects `innerHttp` (storing `k_tgt` inside Relay's own peers!)
+                self.assertEqual(
+                    run_cli(relay_dir, ":connect", "innerHttp", tgt_url, "--token", k_tgt).returncode,
+                    0,
+                )
+                # Wait for `innerNat` reverse session to register on Relay
+                for _ in range(30):
+                    pl = json.loads(run_cli(relay_dir, ":connect", "--help").stdout or "{}") if False else None
+                    code, rlist = rmcp._http_request_json(relay_url + "/route", "POST", k_relay, {"dst": "self", "action": "peers_list"})
+                    if code == 200 and "innerNat" in ((rlist.get("result") or {}).get("reverse_peers") or {}):
+                        break
+                    time.sleep(0.15)
+
+                # --- Mode 0: Relay is OFF by default -> Stranger MUST be rejected (403)! ---
+                off_try = run_cli(
+                    stranger_dir, ":connect", "innerHttp", "--token", k_tgt, "--relay", relay_url
+                )
+                self.assertNotEqual(off_try.returncode, 0)
+                self.assertIn("disabled", off_try.stderr)
+
+                # Stranger trying to execute on Relay `self` without k_relay -> MUST get 401!
+                self_attack = run_cli(
+                    stranger_dir, ":connect", "self", "self", "--token", k_tgt, "--relay", relay_url
+                )
+                self.assertNotEqual(self_attack.returncode, 0)
+
+                # --- Tier 1 (`peers`): Registered peers & reverse tunnels ONLY! ---
+                admin_dir = base / "admin_cli"
+                allowed_ports_csv = f"7777,{p_tgt},{p_unreg},{p_unreg_c1},{p_unreg_c2}"
+                # Update live Relay policy via authenticated admin call to Relay!
+                self.assertEqual(
+                    run_cli(admin_dir, ":connect", "relaySelf", relay_url, "--token", k_relay).returncode,
+                    0,
+                )
+                rel_t1 = run_cli(
+                    admin_dir, "--to", "relaySelf", ":relay", "peers", "--ports", allowed_ports_csv
+                )
+                self.assertEqual(rel_t1.returncode, 0, rel_t1.stderr)
+
+                # CRITICAL SECURITY CHECK: Stranger supplies WRONG target token for `innerHttp`.
+                # Even though Relay itself holds the real `k_tgt` in `peers["innerHttp"]`, Relay MUST NOT inject it!
+                wrong_tok = run_cli(
+                    stranger_dir, ":connect", "innerHttp", "--token", "WRONG-TARGET-TOKEN", "--relay", relay_url
+                )
+                self.assertNotEqual(wrong_tok.returncode, 0)
+                self.assertIn("401", wrong_tok.stderr)
+
+                # Stranger with REAL `k_tgt` (and ZERO `k_relay`) connects to `innerHttp` & executes UTF-8 command!
+                ok_http = run_cli(
+                    stranger_dir, ":connect", "innerHttp", "--token", k_tgt, "--relay", relay_url
+                )
+                self.assertEqual(ok_http.returncode, 0, ok_http.stderr)
+                ex_http = run_cli(
+                    stranger_dir, "--to", "innerHttp", sys.executable, "-c", "print('blind-http-ok 喵')"
+                )
+                self.assertEqual(ex_http.returncode, 0, ex_http.stderr)
+                self.assertIn("blind-http-ok 喵", ex_http.stdout)
+
+                # Stranger with REAL `k_nat` connects to `--dial` reverse-tunnel node `innerNat` through Relay!
+                ok_nat = run_cli(
+                    stranger_dir, ":connect", "innerNat", "--token", k_nat, "--relay", relay_url
+                )
+                self.assertEqual(ok_nat.returncode, 0, ok_nat.stderr)
+                ex_nat = run_cli(
+                    stranger_dir, "--to", "innerNat", sys.executable, "-c", "print('blind-nat-ok 🐾')"
+                )
+                self.assertEqual(ex_nat.returncode, 0, ex_nat.stderr)
+                self.assertIn("blind-nat-ok 🐾", ex_nat.stdout)
+
+                # Tier 1 MUST block unregistered `unreg_url`!
+                t1_unreg = run_cli(
+                    stranger_dir, ":connect", "unregBox", unreg_url, "--token", k_unreg, "--relay", relay_url
+                )
+                self.assertNotEqual(t1_unreg.returncode, 0)
+                self.assertIn("forbids arbitrary dst_url", t1_unreg.stderr)
+
+                # --- Tier 2 (`cidr`): Allow explicit CIDR + allowed ports, then run Blue-Green `:upgrade` through Blind Relay! ---
+                rel_t2 = run_cli(
+                    admin_dir, "--to", "relaySelf", ":relay", "127.0.0.1/32", "--ports", allowed_ports_csv
+                )
+                self.assertEqual(rel_t2.returncode, 0, rel_t2.stderr)
+
+                # Connect to unregistered v0.7.5 `unregBox` via Tier-2 Blind Relay!
+                # Note: v0.7.5 does not know `e2e` yet — let's verify that an older v0.7.5 node rejects `_e2e` downgrade,
+                # and a v0.8.0 node on an unregistered CIDR URL works + upgrades cleanly!
+                self.assertNotEqual(
+                    run_cli(stranger_dir, ":connect", "unregOld", unreg_url, "--token", k_unreg, "--relay", relay_url).returncode,
+                    0,
+                )
+
+                # Launch a v0.8.0 unregistered node (`unregV8`, tweaked comment so hash differs -> triggers real Blue-Green upgrade!)
+                p_unreg8 = _pick_free_port()
+                allowed_ports_csv2 = f"{allowed_ports_csv},{p_unreg8}"
+                run_cli(admin_dir, "--to", "relaySelf", ":relay", "127.0.0.1/32", "--ports", allowed_ports_csv2)
+
+                unreg8_install = base / "unreg8_install"
+                unreg8_install.mkdir(parents=True, exist_ok=True)
+                unreg8_script = unreg8_install / "agent.py"
+                unreg8_script.write_text(Path(RMCP_SCRIPT).read_text(encoding="utf-8") + "\n# slightly-older-build\n", encoding="utf-8")
+                (unreg8_install / "agent.token").write_text(k_unreg, encoding="utf-8")
+                procs.append(
+                    _spawn_daemon(
+                        base / "unreg8_state",
+                        str(unreg8_script),
+                        ["--listen", "--host", "127.0.0.1", "--port", str(p_unreg8)],
+                        cwd=unreg8_install,
+                    )
+                )
+                for _ in range(40):
+                    c, _ = rmcp._http_request_json(f"http://127.0.0.1:{p_unreg8}/ping", "GET", "")
+                    if c == 200:
+                        break
+                    time.sleep(0.1)
+
+                t2_conn = run_cli(
+                    stranger_dir,
+                    ":connect",
+                    "unreg8",
+                    f"http://127.0.0.1:{p_unreg8}",
+                    "--token",
+                    k_unreg,
+                    "--relay",
+                    relay_url,
+                    "--ports",
+                    f"{p_unreg_c1},{p_unreg_c2}",
+                )
+                self.assertEqual(t2_conn.returncode, 0, t2_conn.stderr)
+
+                # Run full Blue-Green `:upgrade` + primary port reclaim RIGHT THROUGH the Zero-Knowledge Blind Relay!
+                t2_upg = run_cli(
+                    stranger_dir, ":upgrade", "unreg8", "--ports", f"{p_unreg_c1},{p_unreg_c2}"
+                )
+                self.assertEqual(t2_upg.returncode, 0, t2_upg.stderr + t2_upg.stdout)
+                upg_doc = json.loads(t2_upg.stdout)
+                self.assertEqual(upg_doc["status"], "upgraded")
+                self.assertTrue(upg_doc["reclaimed_primary_port"])
+                self.assertEqual(upg_doc["primary_port"], p_unreg8)
+                self.assertEqual(upg_doc["new_hash"], rmcp.CODE_HASH)
+                run_cli(stranger_dir, "--to", "unreg8", ":shutdown", "--delay", "0.05")
+            finally:
+                for pr in procs:
+                    if pr.poll() is None:
+                        pr.kill()
+                        pr.wait(timeout=3)
 
 
 if __name__ == "__main__":

@@ -25,6 +25,8 @@ Cross-platform (Linux & Windows) remote execution toolkit with two entrypoints:
      - Over SSH, Base64-framed envelopes stream over `ssh --stdio-hop` / `--stdio-loop` pipes (interactive REPL and multi-chunk file transfers keep multi-hop SSH pipes warm across commands, avoiding repeated SSH handshakes) — bypassing `bash`/`cmd.exe` multi-hop quoting issues and Windows GBK mojibake. `--bootstrap` automatically streams `rmcp.py` to `~/.rmcp/rmcp.py` on the target, and `--via <hop>` lets an intermediate jump host connect onward using **its own SSH keys or private network access**.
      - On SSH-less machines, `--listen` binds an HTTP port with token-derived authenticated encryption (`BLAKE2b-CTR + HMAC-SHA256`) while staying backward-compatible with legacy `agent.py` v0.4.
      - On NAT / inbound-blocked machines without SSH, `--dial <hub_url> --token <T>` establishes an outbound long-polling reverse tunnel to any listening hub node so the whole mesh can route into it.
+     - **Blue-Green multi-port self-upgrade + primary port reclaim (`:upgrade`)**: computes an LF-normalized runtime source hash (`code_hash`, avoiding self-referential hash recursion); brings up the Green instance on a candidate port (`7778,7779,7780` by default) and verifies end-to-end external reachability BEFORE shutting down Blue, immediately reclaims the primary port (`7777`), and releases the candidate port (or rolls back cleanly with zero downtime if Green fails). Supports `--standby-if-busy` for external batch supervisor scripts.
+     - **Two-tier zero-knowledge stranger blind relay (`--allow-relay` / `:relay` / `:connect --relay`)**: when a relay node opts into stranger forwarding, callers can connect to target hosts **without knowing the relay's token** — knowing only the target's token (`e2e` envelopes bound to `pkt_id`; the relay never decrypts payloads or injects stored peer tokens). Supports Tier 1 (`peers`: registered peers/routes and `--dial` reverse sessions only) and Tier 2 (`private` or explicit CIDRs + allowed ports, with hard SSRF blocks on loopback, link-local, multicast, and cloud metadata IPs).
      - Built-in `--watchdog` crash supervisor and `:autostart on` (silent user `Startup` `.vbs` on Windows requiring no admin rights; user `crontab @reboot` on Linux).
 2. **`server.py` + `agent.py` (MCP Server + Lightweight HTTP Agent)** — exposes 14 `remote_*` MCP tools to Claude Code and other MCP clients.
 
@@ -54,6 +56,16 @@ python rmcp.py :connect box7 http://192.168.50.20:7777 --token <TOKEN> --via win
 
 # D. Inbound-blocked NAT host (no SSH, no open ports): dial outbound to a hub
 python rmcp.py :dial http://10.12.23.6:7777 --token <HUB_TOKEN> --alias nat-pc --watchdog --daemon
+
+# E. Zero-knowledge stranger blind relay (connect using ONLY target's token, without relay's token)
+python rmcp.py --to relay-hub :relay peers                              # Tier 1: registered peers / --dial nodes only
+python rmcp.py --to relay-hub :relay 192.168.88.0/24 --ports 7777,7778  # Tier 2: explicit subnet + allowed ports
+python rmcp.py :connect nat-pc --token <TARGET_TOKEN> --relay http://10.12.23.6:7777
+python rmcp.py :connect cam188 http://192.168.88.188:7777 --token <TARGET_TOKEN> --relay http://10.12.23.6:7777
+
+# F. Blue-Green self-upgrade (verify Green on candidate port -> stop Blue -> reclaim primary port 7777)
+python rmcp.py :upgrade box7
+python rmcp.py :upgrade --all
 ```
 
 ### 2. Daily CLI Usage (One-Shot Bot Friendly)
@@ -98,10 +110,12 @@ python rmcp.py :repl nat-pc                   # or simply run `python rmcp.py` i
 | `:id [--alias <name>]` | Show deterministic `node_id`, alias, and current caller origin (`caller`) |
 | `:sessions [--clear\|--clear-all]` | List or clear isolated per-caller sessions on this machine |
 | `:nodes` (`:peers`, `:routes`) | Show local or remote node's peers, cached routes, and reverse sessions |
-| `:connect <alias> <endpoint> [--bootstrap] [--token T] [--via <hop>]` | Connect and record an SSH or HTTP peer edge |
+| `:connect <alias> [endpoint] [--bootstrap] [--token T] [--via <hop>] [--relay <relay>]` | Connect an SSH, HTTP, or zero-knowledge blind-relayed (`--relay`) peer |
 | `:disconnect <alias> [--via <hop>]` | Remove a recorded peer edge and invalidated routes |
 | `:use <target>` (`:to <target>`) | Probe reachability and switch active target (`:use self` for local) |
-| `:listen [--port 7777] [--token T] [--daemon] [--watchdog]` | Run encrypted HTTP router + reverse-tunnel hub |
+| `:upgrade [target\|--all] [--ports 7778,7779,7780] [--force]` | Blue-Green self-upgrade + primary port reclaim (verifies Green before stopping Blue) |
+| `:relay [status\|off\|peers\|private\|<CIDR,...>] [--ports ...] [--local]` | Inspect or configure 2-tier stranger zero-knowledge blind relay policy |
+| `:listen [--port 7777] [--token T] [--allow-relay ...] [--standby-if-busy] [--daemon] [--watchdog]` | Run encrypted HTTP router + reverse-tunnel hub |
 | `:dial <hub_url> --token <T> [--alias A] [--daemon] [--watchdog]` | Dial outbound reverse long-polling tunnel into a hub |
 | `:autostart [status\|on\|off] [--port P] [--dial URL --token T] [--local]` | Configure boot autostart on active target (or `--local`) |
 | `:ping [target]` / `:env [target]` | Probe hop path / inspect OS, shells, Python, and disk |

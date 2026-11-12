@@ -26,6 +26,7 @@ import contextlib
 import hashlib
 import hmac
 import http.client
+import ipaddress
 import json
 import mimetypes
 import os
@@ -50,17 +51,38 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-VERSION = "0.7.0"
+VERSION = "0.8.0"
 IS_WINDOWS = sys.platform.startswith("win")
 HERE = Path(__file__).resolve().parent
+_EFFECTIVE_SCRIPT_PATH: Path = Path(__file__).resolve()
 
 SMALL_FILE_LIMIT = 8 * 1024 * 1024
 STREAM_CHUNK = 512 * 1024
 DEFAULT_TTL = 6
 CRYPTO_WINDOW_SEC = 600
+DEFAULT_CANDIDATE_PORTS: tuple[int, ...] = (7778, 7779, 7780)
+DEFAULT_RELAY_PORTS: tuple[int, ...] = (7777, 7778, 7779, 7780)
+PRIVATE_RELAY_CIDRS: tuple[str, ...] = (
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "100.64.0.0/10",
+)
 
 FRAME_REQ_PREFIX = "RMCP_ENV:"
 FRAME_RES_PREFIX = "RMCP_RES:"
+
+
+def compute_code_hash(path: Path | None = None) -> str:
+    """Compute LF-normalized SHA-256[:12] of script bytes (non-recursive runtime self-hash)."""
+    target = path or Path(__file__).resolve()
+    with contextlib.suppress(Exception):
+        raw = target.read_bytes().replace(b"\r\n", b"\n")
+        return hashlib.sha256(raw).hexdigest()[:12]
+    return "unknown"
+
+
+CODE_HASH = compute_code_hash()
 
 
 # ---------------------------------------------------------------------------
@@ -338,8 +360,115 @@ def _session_file_for_key(caller_key: str) -> Path:
     return _sessions_dir() / f"{digest}.json"
 
 
+_RUNTIME_RELAY_POLICY: dict | None = None
+
+
+def _parse_port_list(raw: str | list | tuple | None, default: tuple[int, ...] = DEFAULT_RELAY_PORTS) -> list[int]:
+    if not raw:
+        return list(default)
+    items = raw.split(",") if isinstance(raw, str) else list(raw)
+    ports: list[int] = []
+    for it in items:
+        s = str(it).strip()
+        if not s:
+            continue
+        p = int(s)
+        if not (1 <= p <= 65535):
+            raise ValueError(f"invalid port: {p}")
+        if p not in ports:
+            ports.append(p)
+    return ports or list(default)
+
+
+def normalize_relay_policy(raw: dict | None) -> dict:
+    if not isinstance(raw, dict):
+        return {"mode": "off", "cidrs": [], "ports": list(DEFAULT_RELAY_PORTS)}
+    mode = str(raw.get("mode") or "off").lower().strip()
+    if mode not in ("off", "peers", "cidr"):
+        mode = "off"
+    cidrs: list[str] = []
+    for c in raw.get("cidrs") or []:
+        with contextlib.suppress(Exception):
+            cidrs.append(str(ipaddress.ip_network(str(c).strip(), strict=False)))
+    ports = _parse_port_list(raw.get("ports"), DEFAULT_RELAY_PORTS)
+    return {"mode": mode, "cidrs": cidrs, "ports": ports}
+
+
+def parse_relay_spec(spec: str, ports_raw: str | list | None = None, base: dict | None = None) -> dict:
+    cur = normalize_relay_policy(base)
+    ports = _parse_port_list(ports_raw, tuple(cur["ports"])) if ports_raw else cur["ports"]
+    s = (spec or "").strip()
+    low = s.lower()
+    if not s or low in ("off", "none", "false", "0", "disable", "disabled"):
+        return {"mode": "off", "cidrs": [], "ports": ports}
+    if low in ("peers", "1", "tier1", "registered"):
+        return {"mode": "peers", "cidrs": [], "ports": ports}
+    if low in ("private", "lan", "2", "tier2"):
+        return {"mode": "cidr", "cidrs": list(PRIVATE_RELAY_CIDRS), "ports": ports}
+    nets: list[str] = []
+    for part in s.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        net = ipaddress.ip_network(part, strict=False)
+        nets.append(str(net))
+    if not nets:
+        raise ValueError(f"invalid relay spec '{spec}' (expected off | peers | private | <CIDR,...>)")
+    return {"mode": "cidr", "cidrs": nets, "ports": ports}
+
+
+def get_effective_relay_policy(topo: dict | None = None) -> dict:
+    if _RUNTIME_RELAY_POLICY is not None:
+        return normalize_relay_policy(_RUNTIME_RELAY_POLICY)
+    t = topo if topo is not None else load_topology_state()
+    return normalize_relay_policy(t.get("relay_policy"))
+
+
+def _validate_stranger_dst_url(dst_url: str, policy: dict) -> str:
+    """Validate Tier-2 stranger relay `dst_url` against SSRF blocklist, allowed CIDRs, and allowed ports."""
+    parsed = urllib.parse.urlsplit(dst_url.strip())
+    if parsed.scheme not in ("http", "https"):
+        raise PermissionError(f"disallowed dst_url scheme '{parsed.scheme}'")
+    host = parsed.hostname
+    if not host:
+        raise PermissionError("missing hostname in dst_url")
+    port = parsed.port or (443 if parsed.scheme == "https" else 7777)
+    allowed_ports = policy.get("ports") or list(DEFAULT_RELAY_PORTS)
+    if port not in allowed_ports:
+        raise PermissionError(f"port {port} not in relay allowed ports {allowed_ports}")
+    networks = [ipaddress.ip_network(c, strict=False) for c in (policy.get("cidrs") or [])]
+    if not networks:
+        raise PermissionError("no allowed CIDRs configured on relay")
+
+    try:
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except Exception as exc:
+        raise PermissionError(f"cannot resolve dst_url host '{host}': {exc}") from exc
+    if not infos:
+        raise PermissionError(f"no address records for '{host}'")
+
+    allow_test_loopback = os.environ.get("RMCP_TEST_ALLOW_LOOPBACK_RELAY") == "1"
+    own_ports = set(get_active_listen_ports())
+
+    for info in infos:
+        addr_str = info[4][0].split("%", 1)[0]
+        ip = ipaddress.ip_address(addr_str)
+        if ip.is_link_local or ip.is_multicast or ip.is_unspecified or ip.is_reserved:
+            raise PermissionError(f"relay SSRF protection blocked non-routable address {ip}")
+        if ip.is_loopback:
+            if not allow_test_loopback or not any(net.is_loopback for net in networks):
+                raise PermissionError(f"relay SSRF protection blocked loopback address {ip}")
+            if port in own_ports:
+                raise PermissionError(f"relay SSRF protection blocked relay's own listener port {port}")
+        if not any(ip in net for net in networks):
+            raise PermissionError(f"destination IP {ip} outside relay allowed CIDRs {policy.get('cidrs')}")
+
+    host_fmt = f"[{host}]" if ":" in host else host
+    return f"{parsed.scheme}://{host_fmt}:{port}"
+
+
 def load_topology_state() -> dict:
-    """Load machine-wide shared Mesh Topology (`node_id`, `alias`, `peers`, `routes`)."""
+    """Load machine-wide shared Mesh Topology (`node_id`, `alias`, `peers`, `routes`, `relay_policy`)."""
     rf = _router_file()
     topo: dict = {}
     if rf.exists():
@@ -353,6 +482,7 @@ def load_topology_state() -> dict:
     topo.setdefault("default_active", topo.get("active", ""))
     topo.setdefault("peers", {})
     topo.setdefault("routes", {})
+    topo["relay_policy"] = normalize_relay_policy(topo.get("relay_policy"))
     legacy_cwds: dict[str, str] = dict(topo.get("cwds") or {})
 
     # Auto-import HTTP hosts from legacy hosts.json (non-destructively)
@@ -412,6 +542,9 @@ def save_topology_state(state: dict) -> None:
             ),
             "peers": state.get("peers") if "peers" in state else existing.get("peers", {}),
             "routes": state.get("routes") if "routes" in state else existing.get("routes", {}),
+            "relay_policy": normalize_relay_policy(
+                state["relay_policy"] if "relay_policy" in state else existing.get("relay_policy")
+            ),
         }
         _atomic_write_json(rf, out)
 
@@ -524,6 +657,7 @@ def load_router_state() -> dict:
         "default_active": topo.get("default_active", ""),
         "peers": topo["peers"],
         "routes": topo["routes"],
+        "relay_policy": topo.get("relay_policy", normalize_relay_policy(None)),
         "active": effective_active,
         "cwds": merged_cwds,
         "caller_key": sess["caller_key"],
@@ -805,6 +939,10 @@ def _collect_env_snapshot() -> dict:
     state = load_router_state()
     return {
         "agent_version": VERSION,
+        "code_hash": CODE_HASH,
+        "script_path": str(_EFFECTIVE_SCRIPT_PATH),
+        "listen_ports": get_active_listen_ports(),
+        "relay_policy": get_effective_relay_policy(state),
         "node_id": state["node_id"],
         "alias": state["alias"],
         "platform": sys.platform,
@@ -935,14 +1073,21 @@ def execute_local_action(action: str, params: dict, origin: dict | None = None) 
     caller_label = _format_origin_label(origin)
 
     if action == "ping":
+        rpol = get_effective_relay_policy(state)
         out = {
             "ok": True,
             "version": VERSION,
+            "code_hash": CODE_HASH,
             "node_id": state["node_id"],
             "alias": state["alias"],
             "hostname": socket.gethostname(),
             "pid": os.getpid(),
             "cwd": str(Path.cwd()),
+            "script_path": str(_EFFECTIVE_SCRIPT_PATH),
+            "python": sys.executable,
+            "listen_ports": get_active_listen_ports(),
+            "listen_host": _LISTENER_HOST,
+            "relay_mode": rpol["mode"],
             "user": current_user(),
             "platform": sys.platform,
             "is_windows": IS_WINDOWS,
@@ -1242,11 +1387,13 @@ def execute_local_action(action: str, params: dict, origin: dict | None = None) 
         # Connect and register a downstream peer directly FROM this node!
         return connect_peer_local(
             alias=params["alias"],
-            endpoint=params["endpoint"],
+            endpoint=params.get("endpoint", ""),
             token=params.get("token", ""),
             bootstrap=bool(params.get("bootstrap", False)),
             remote_path=params.get("remote_path", ""),
             ssh_port=params.get("ssh_port"),
+            relay=params.get("relay", ""),
+            candidate_ports=params.get("candidate_ports"),
         )
 
     if action == "peer_remove":
@@ -1267,6 +1414,9 @@ def execute_local_action(action: str, params: dict, origin: dict | None = None) 
         return {
             "node_id": st["node_id"],
             "alias": st["alias"],
+            "version": VERSION,
+            "code_hash": CODE_HASH,
+            "relay_policy": get_effective_relay_policy(st),
             "peers": {
                 k: {pk: pv for pk, pv in v.items() if pk != "token"}
                 for k, v in st["peers"].items()
@@ -1275,12 +1425,37 @@ def execute_local_action(action: str, params: dict, origin: dict | None = None) 
             "reverse_peers": list_reverse_peers(),
         }
 
+    if action == "relay_config":
+        return _handle_local_relay_config(params)
+
+    if action == "pick_free_port":
+        host = str(params.get("host") or _LISTENER_HOST or "0.0.0.0")
+        cands = _parse_port_list(params.get("candidates"), DEFAULT_CANDIDATE_PORTS)
+        active = set(get_active_listen_ports())
+        for p in cands:
+            if p not in active and _can_bind_exclusive(host, p):
+                return {"ok": True, "port": p, "host": host}
+        raise RuntimeError(f"no free candidate port in {cands} on {host}")
+
+    if action == "upgrade_prepare_reclaim":
+        return _handle_upgrade_prepare_reclaim(params)
+
+    if action == "upgrade_finalize":
+        return _handle_upgrade_finalize(params)
+
     if action == "shutdown":
-        delay = max(0.1, min(30.0, float(params.get("delay", 1.0))))
-        threading.Thread(
-            target=lambda: (time.sleep(delay), os._exit(0)),
-            daemon=True,
-        ).start()
+        delay = max(0.05, min(30.0, float(params.get("delay", 1.0))))
+        close_all = bool(params.get("close_listeners", True))
+
+        def _do_shutdown() -> None:
+            time.sleep(delay)
+            if close_all:
+                for lp in get_active_listen_ports():
+                    with contextlib.suppress(Exception):
+                        _close_listener_port(lp)
+            os._exit(0)
+
+        threading.Thread(target=_do_shutdown, daemon=True).start()
         return {"ok": True, "pid": os.getpid(), "exit_in_seconds": delay}
 
     raise ValueError(f"unknown action: {action}")
@@ -1905,19 +2080,60 @@ def _fallback_legacy_agent_http(peer: dict, env: dict, timeout: float = 120.0) -
     return {"ok": False, "error": f"legacy agent does not support '{action}' (upgrade agent to rmcp.py)"}
 
 
-def send_via_http(peer: dict, env: dict, timeout: float = 120.0) -> dict:
-    base = peer["url"].rstrip("/")
-    tok = peer.get("token", "")
+def _replace_url_port(url: str, new_port: int) -> str:
+    parsed = urllib.parse.urlsplit(url.strip())
+    host = parsed.hostname or ""
+    host_fmt = f"[{host}]" if ":" in host else host
+    netloc = f"{host_fmt}:{int(new_port)}"
+    return urllib.parse.urlunsplit((parsed.scheme or "http", netloc, parsed.path, parsed.query, parsed.fragment)).rstrip("/")
 
-    # Encrypt sensitive inner body over HTTP when token is configured
+
+def _is_conn_refused_or_unreachable(code: int, err_msg: object) -> bool:
+    if code != 0:
+        return False
+    low = str(err_msg).lower()
+    return any(
+        w in low
+        for w in ("refused", "10061", "111", "timed out", "timeout", "unreachable", "reset", "10054", "closed")
+    )
+
+
+def send_via_http(peer: dict, env: dict, timeout: float = 120.0) -> dict:
+    raw_base = peer["url"].rstrip("/")
+    untrusted_relay = bool(env.get("untrusted_relay"))
+    tok = "" if untrusted_relay else peer.get("token", "")
+    dst_port = env.get("dst_port")
+
     wire_env = dict(env)
-    if tok and "enc" not in wire_env:
+    wire_env.pop("dst_port", None)
+    if tok and "enc" not in wire_env and "e2e" not in wire_env:
         inner: dict = {"action": wire_env.pop("action"), "params": wire_env.pop("params", {})}
         if "origin" in wire_env:
             inner["origin"] = wire_env.pop("origin")
         wire_env["enc"] = encrypt_obj(inner, tok)
 
-    code, res = _http_request_json(base + "/route", "POST", tok, wire_env, timeout=timeout)
+    if dst_port:
+        bases = [_replace_url_port(raw_base, int(dst_port))]
+    else:
+        bases = [raw_base]
+        cands = peer.get("candidate_ports") or []
+        for cp in cands:
+            alt = _replace_url_port(raw_base, int(cp))
+            if alt not in bases:
+                bases.append(alt)
+
+    code = 0
+    res: dict | str = ""
+    for idx, base in enumerate(bases):
+        code, res = _http_request_json(base + "/route", "POST", tok, wire_env, timeout=timeout)
+        if code == 0 and idx == 0 and not dst_port and _is_conn_refused_or_unreachable(code, res):
+            # Brief 180ms retry on primary port to bridge Blue->Green port reclaim seamlessly
+            time.sleep(0.18)
+            raw_retry_env = dict(wire_env)
+            code, res = _http_request_json(base + "/route", "POST", tok, raw_retry_env, timeout=timeout)
+        if code != 0:
+            break
+
     if code == 200 and isinstance(res, dict):
         if tok and "enc" in res:
             try:
@@ -1929,6 +2145,20 @@ def send_via_http(peer: dict, env: dict, timeout: float = 120.0) -> dict:
         return res
 
     err_msg = res.get("error") if isinstance(res, dict) else str(res)
+    if isinstance(res, dict) and res.get("e2e_auth_failed"):
+        return {
+            "ok": False,
+            "reached_dst": True,
+            "e2e_auth_failed": True,
+            "error": f"HTTP {code} from {peer.get('alias')}: {err_msg}",
+        }
+
+    if untrusted_relay:
+        return {
+            "ok": False,
+            "reached_dst": bool(isinstance(res, dict) and res.get("reached_dst")),
+            "error": f"HTTP {code} from {peer.get('alias')}: {err_msg}",
+        }
 
     # Automatic fallback for older v0.4 agent.py instances without /route
     # Note: Older Windows agent.py closes connection on 404 without draining POST body,
@@ -1938,10 +2168,108 @@ def send_via_http(peer: dict, env: dict, timeout: float = 120.0) -> dict:
         code == 404
         or (code == 0 and any(w in str(err_msg).lower() for w in ("10054", "reset", "closed", "broken pipe")))
     )
-    if is_reset_or_404 and dst in ("self", peer.get("alias"), peer.get("node_id"), peer.get("hostname")):
+    if (
+        not dst_port
+        and is_reset_or_404
+        and dst in ("self", peer.get("alias"), peer.get("node_id"), peer.get("hostname"))
+    ):
         return _fallback_legacy_agent_http(peer, env, timeout=timeout)
 
     return {"ok": False, "error": f"HTTP {code} from {peer.get('alias')}: {err_msg}"}
+
+
+def send_via_e2e_relay(peer: dict, env: dict, timeout: float = 120.0) -> dict:
+    """Zero-knowledge E2E blind relay transport: encrypts inner envelope with target's token ONLY."""
+    target_tok = peer.get("token", "")
+    if not target_tok:
+        return {"ok": False, "error": f"e2e_relay peer '{peer.get('alias')}' requires target --token"}
+    relay_spec = str(peer.get("relay") or "").strip()
+    if not relay_spec:
+        return {"ok": False, "error": f"e2e_relay peer '{peer.get('alias')}' missing --relay"}
+
+    dst_port = env.get("dst_port")
+    dst_url = str(peer.get("dst_url") or "").strip()
+    if dst_url and dst_port:
+        dst_url = _replace_url_port(dst_url, int(dst_port))
+
+    def _make_outer(pkt_id_val: str, url_override: str = "") -> dict:
+        inner: dict = {
+            "pkt_id": pkt_id_val,
+            "action": env.get("action") or "ping",
+            "params": env.get("params") or {},
+        }
+        if "origin" in env:
+            inner["origin"] = env["origin"]
+        outer: dict = {
+            "v": 1,
+            "pkt_id": pkt_id_val,
+            "ttl": int(env.get("ttl", DEFAULT_TTL)),
+            "src": env.get("src", ""),
+            "dst": peer.get("remote_dst") or peer.get("alias") or "self",
+            "via": list(env.get("via") or []),
+            "via_ids": list(env.get("via_ids") or []),
+            "action": "_e2e",
+            "untrusted_relay": True,
+            "e2e": encrypt_obj(inner, target_tok),
+        }
+        effective_url = url_override or dst_url
+        if effective_url:
+            outer["dst_url"] = effective_url
+        elif dst_port:
+            outer["dst_port"] = int(dst_port)
+        return outer
+
+    pkt_id = str(env.get("pkt_id") or uuid.uuid4())
+    outer_env = _make_outer(pkt_id)
+
+    if relay_spec.startswith(("http://", "https://")):
+        relay_base = relay_spec.rstrip("/")
+        code, res = _http_request_json(relay_base + "/route", "POST", "", outer_env, timeout=timeout)
+        # If target just switched Blue->Green port, retry once after 180ms or try candidate_ports
+        if (
+            (code == 0 or (isinstance(res, dict) and not res.get("ok") and not res.get("e2e_auth_failed") and "HTTP 0 " in str(res.get("error", ""))))
+            and not dst_port
+        ):
+            time.sleep(0.18)
+            outer_retry = _make_outer(str(uuid.uuid4()))
+            code, res = _http_request_json(relay_base + "/route", "POST", "", outer_retry, timeout=timeout)
+            if (not isinstance(res, dict) or not res.get("ok")) and dst_url and peer.get("candidate_ports"):
+                for cp in peer.get("candidate_ports") or []:
+                    alt_url = _replace_url_port(dst_url, int(cp))
+                    c2, r2 = _http_request_json(
+                        relay_base + "/route", "POST", "", _make_outer(str(uuid.uuid4()), alt_url), timeout=timeout
+                    )
+                    if c2 == 200 and isinstance(r2, dict) and r2.get("ok"):
+                        code, res = c2, r2
+                        break
+        if not isinstance(res, dict):
+            return {"ok": False, "error": f"relay {relay_spec} HTTP {code}: {res}"}
+    else:
+        # Relay is a local mesh peer alias (e.g. SSH or HTTP hop without sharing target token)
+        topo = load_topology_state()
+        hop_peer = (topo.get("peers") or {}).get(relay_spec)
+        if not hop_peer:
+            return {"ok": False, "error": f"unknown relay peer '{relay_spec}'"}
+        res = _send_to_peer(relay_spec, hop_peer, outer_env, timeout=timeout)
+        code = 200 if res.get("ok") else 400
+
+    if "e2e" in res:
+        try:
+            dec = decrypt_obj(res["e2e"], target_tok)
+            merged = {k: v for k, v in res.items() if k != "e2e"}
+            merged.update(dec)
+            return merged
+        except Exception as e:
+            return {"ok": False, "error": f"target E2E response decryption failed: {e}"}
+
+    if code != 200 or not res.get("ok"):
+        return {
+            "ok": False,
+            "reached_dst": bool(res.get("reached_dst")),
+            "e2e_auth_failed": bool(res.get("e2e_auth_failed")),
+            "error": res.get("error") or f"relay HTTP {code}",
+        }
+    return {"ok": False, "error": "missing E2E encrypted response from target"}
 
 
 def _send_to_peer(peer_alias: str, peer: dict, env: dict, timeout: float = 120.0) -> dict:
@@ -1950,6 +2278,8 @@ def _send_to_peer(peer_alias: str, peer: dict, env: dict, timeout: float = 120.0
         return send_via_ssh(peer, env, timeout=timeout)
     if ptype == "http":
         return send_via_http(peer, env, timeout=timeout)
+    if ptype == "e2e_relay":
+        return send_via_e2e_relay(peer, env, timeout=timeout)
     return {"ok": False, "error": f"unsupported peer type '{ptype}' on {peer_alias}"}
 
 
@@ -1972,11 +2302,10 @@ def _peer_matches_target(peer_alias: str, peer: dict, dst: str) -> bool:
     )
 
 
-def _peer_in_via(peer_alias: str, peer: dict, via: list[str]) -> bool:
-    via_set = set(via)
-    for ident in (peer_alias, peer.get("alias"), peer.get("node_id"), peer.get("hostname")):
-        if ident and ident in via_set:
-            return True
+def _peer_in_via(peer_alias: str, peer: dict, via_ids: list[str]) -> bool:
+    p_nid = peer.get("node_id")
+    if p_nid:
+        return p_nid in set(via_ids)
     return False
 
 
@@ -2002,29 +2331,96 @@ def _learn_route(dst: str, next_hop_alias: str, resp: dict) -> None:
         save_topology_state(state)
 
 
+def _get_local_node_secret() -> str:
+    return NodeHTTPHandler.daemon_token or load_or_create_daemon_token()
+
+
+def _match_registered_http_peer_by_url(
+    dst_url: str,
+    peers: dict[str, dict],
+    allowed_ports: list[int],
+) -> tuple[str, dict] | None:
+    parsed = urllib.parse.urlsplit(dst_url.strip())
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return None
+    req_port = parsed.port or (443 if parsed.scheme == "https" else 7777)
+    if req_port not in allowed_ports:
+        return None
+    for p_alias, p_cfg in peers.items():
+        if p_cfg.get("type") != "http" or not p_cfg.get("url"):
+            continue
+        pp = urllib.parse.urlsplit(str(p_cfg["url"]).strip())
+        pp_port = pp.port or (443 if pp.scheme == "https" else 7777)
+        peer_ports = {pp_port} | {int(x) for x in (p_cfg.get("candidate_ports") or [])}
+        if (
+            pp.scheme == parsed.scheme
+            and (pp.hostname or "").lower() == parsed.hostname.lower()
+            and req_port in peer_ports
+        ):
+            matched = dict(p_cfg)
+            matched["url"] = _replace_url_port(str(p_cfg["url"]), req_port)
+            return p_alias, matched
+    return None
+
+
 def route_envelope(env: dict, timeout: float = 120.0) -> dict:
-    """Process or route a mesh envelope with loop prevention and route caching."""
+    """Process or route a mesh envelope with loop prevention, E2E verification, and route caching."""
+    if env.get("hop_timeout"):
+        with contextlib.suppress(ValueError, TypeError):
+            timeout = min(timeout, max(1.5, float(env["hop_timeout"])))
     pkt_id = str(env.get("pkt_id") or uuid.uuid4())
-    if mark_packet_seen(pkt_id):
+    is_local_origin = bool(env.pop("_local_origin", False))
+    if not is_local_origin and mark_packet_seen(pkt_id):
         return {"ok": False, "error": "duplicate_packet_dropped", "loop": True}
 
     state = load_topology_state()
     my_id = state["node_id"]
     my_alias = state["alias"]
     dst = str(env.get("dst") or "self")
+    dst_url = str(env.get("dst_url") or "").strip()
     via = list(env.get("via") or [])
+    via_ids = list(env.get("via_ids") or [])
+    untrusted_relay = bool(env.get("untrusted_relay"))
 
-    if my_id in via or (my_alias and my_alias in via):
+    if my_id in via_ids:
         return {"ok": False, "error": "routing_loop_detected", "loop": True}
 
-    # 1. Destination is THIS node!
-    if _is_local_target(dst, state):
-        action = str(env.get("action") or "ping")
-        params = env.get("params") or {}
-        origin = env.get("origin") if isinstance(env.get("origin"), dict) else None
+    # 1. Destination is THIS node (when no transit dst_url is pending)!
+    if _is_local_target(dst, state) and not dst_url:
+        was_e2e = "e2e" in env
+        if untrusted_relay and not was_e2e:
+            return {
+                "ok": False,
+                "reached_dst": True,
+                "e2e_auth_failed": True,
+                "node_id": my_id,
+                "error": "unauthorized: untrusted relay envelope missing e2e token proof",
+            }
+        if was_e2e:
+            my_secret = _get_local_node_secret()
+            try:
+                inner = decrypt_obj(env["e2e"], my_secret)
+                if str(inner.get("pkt_id") or "") != pkt_id:
+                    raise ValueError("pkt_id mismatch inside e2e envelope")
+            except Exception as e:
+                return {
+                    "ok": False,
+                    "reached_dst": True,
+                    "e2e_auth_failed": True,
+                    "node_id": my_id,
+                    "error": f"unauthorized (invalid target token): {e}",
+                }
+            action = str(inner.get("action") or "ping")
+            params = inner.get("params") or {}
+            origin = inner.get("origin") if isinstance(inner.get("origin"), dict) else None
+        else:
+            action = str(env.get("action") or "ping")
+            params = env.get("params") or {}
+            origin = env.get("origin") if isinstance(env.get("origin"), dict) else None
+
         try:
             result = execute_local_action(action, params, origin=origin)
-            return {
+            resp: dict = {
                 "ok": True,
                 "reached_dst": True,
                 "node_id": my_id,
@@ -2032,18 +2428,27 @@ def route_envelope(env: dict, timeout: float = 120.0) -> dict:
                 "hostname": socket.gethostname(),
                 "platform": sys.platform,
                 "via": via + [my_alias or my_id],
-                "result": result,
             }
+            if was_e2e:
+                resp["e2e"] = encrypt_obj({"result": result}, _get_local_node_secret())
+            else:
+                resp["result"] = result
+            return resp
         except Exception as e:
-            return {
+            err_str = f"{type(e).__name__}: {e}"
+            resp = {
                 "ok": False,
                 "reached_dst": True,
                 "node_id": my_id,
                 "via": via + [my_alias or my_id],
-                "error": f"{type(e).__name__}: {e}",
             }
+            if was_e2e:
+                resp["e2e"] = encrypt_obj({"error": err_str}, _get_local_node_secret())
+            else:
+                resp["error"] = err_str
+            return resp
 
-    # 2. Check TTL before forwarding
+    # 2. Check TTL & Stranger Relay Policy before forwarding
     ttl = int(env.get("ttl", DEFAULT_TTL)) - 1
     if ttl <= 0:
         return {"ok": False, "error": f"ttl_expired reaching '{dst}'", "ttl_expired": True}
@@ -2053,7 +2458,48 @@ def route_envelope(env: dict, timeout: float = 120.0) -> dict:
         "pkt_id": pkt_id,
         "ttl": ttl,
         "via": via + [my_alias or my_id],
+        "via_ids": via_ids + [my_id],
     }
+
+    peers: dict[str, dict] = state.get("peers") or {}
+    if untrusted_relay:
+        policy = get_effective_relay_policy(state)
+        if policy["mode"] == "off":
+            return {"ok": False, "error": "stranger blind relay is disabled on this node"}
+        allowed_ports = policy.get("ports") or list(DEFAULT_RELAY_PORTS)
+        if fwd_env.get("dst_port") and int(fwd_env["dst_port"]) not in allowed_ports:
+            return {
+                "ok": False,
+                "error": f"dst_port {fwd_env['dst_port']} not in relay allowed ports {allowed_ports}",
+            }
+        if dst_url:
+            eff_url = (
+                _replace_url_port(dst_url, int(fwd_env["dst_port"]))
+                if fwd_env.get("dst_port")
+                else dst_url
+            )
+            reg_match = _match_registered_http_peer_by_url(eff_url, peers, allowed_ports)
+            if reg_match is not None:
+                p_alias, p_cfg = reg_match
+                if _peer_in_via(p_alias, p_cfg, via_ids):
+                    return {"ok": False, "error": "target peer already in via path"}
+                clean_fwd = {k: v for k, v in fwd_env.items() if k not in ("dst_url", "dst_port")}
+                clean_fwd["dst"] = "self"
+                return send_via_http(p_cfg, clean_fwd, timeout=timeout)
+
+            if policy["mode"] != "cidr":
+                return {
+                    "ok": False,
+                    "error": f"relay policy '{policy['mode']}' forbids arbitrary dst_url (only registered peers allowed)",
+                }
+            try:
+                clean_base = _validate_stranger_dst_url(eff_url, policy)
+            except PermissionError as pe:
+                return {"ok": False, "error": str(pe)}
+            clean_fwd = {k: v for k, v in fwd_env.items() if k not in ("dst_url", "dst_port")}
+            clean_fwd["dst"] = "self"
+            ad_hoc_peer = {"alias": dst or clean_base, "type": "http", "url": clean_base, "token": ""}
+            return send_via_http(ad_hoc_peer, clean_fwd, timeout=timeout)
 
     # 3. Direct Reverse-Connected Peer match?
     rev_sess = _find_reverse_session(dst)
@@ -2061,10 +2507,9 @@ def route_envelope(env: dict, timeout: float = 120.0) -> dict:
         return send_via_reverse(rev_sess, {**fwd_env, "dst": "self"}, timeout=timeout)
 
     # 4. Direct Outbound Peer match?
-    peers: dict[str, dict] = state.get("peers") or {}
     for p_alias, p_cfg in peers.items():
         if _peer_matches_target(p_alias, p_cfg, dst):
-            if _peer_in_via(p_alias, p_cfg, via):
+            if _peer_in_via(p_alias, p_cfg, via_ids):
                 return {"ok": False, "error": "target peer already in via path"}
             return _send_to_peer(p_alias, p_cfg, {**fwd_env, "dst": "self"}, timeout=timeout)
 
@@ -2074,33 +2519,39 @@ def route_envelope(env: dict, timeout: float = 120.0) -> dict:
     tried_hops: set[str] = set()
     if cached:
         nh = cached.get("next_hop", "")
-        if nh in peers and not _peer_in_via(nh, peers[nh], via):
+        if nh in peers and not _peer_in_via(nh, peers[nh], via_ids):
             tried_hops.add(nh)
             resp = _send_to_peer(nh, peers[nh], fwd_env, timeout=timeout)
             if resp.get("ok") or resp.get("reached_dst"):
-                _learn_route(dst, nh, resp)
+                if not untrusted_relay:
+                    _learn_route(dst, nh, resp)
                 return resp
             # Otherwise dynamically learned route is stale; evict and fall through to discovery flood
-            if not cached.get("explicit"):
+            if not cached.get("explicit") and not untrusted_relay:
                 with _STATE_LOCK:
                     st2 = load_topology_state()
                     st2["routes"].pop(dst, None)
                     save_topology_state(st2)
         else:
             rev_nh = _find_reverse_session(nh)
-            if rev_nh is not None and nh not in via:
+            if rev_nh is not None and rev_nh.node_id not in via_ids:
                 tried_hops.add(nh)
                 resp = send_via_reverse(rev_nh, fwd_env, timeout=timeout)
                 if resp.get("ok") or resp.get("reached_dst"):
-                    _learn_route(dst, nh, resp)
+                    if not untrusted_relay:
+                        _learn_route(dst, nh, resp)
                     return resp
 
-    # 6. Controlled Flood Discovery across remaining neighbors (anti-storm protected)
+    if untrusted_relay:
+        return {"ok": False, "error": f"no registered peer or route for '{dst}' on relay"}
+
+    # 6. Controlled Flood Discovery across remaining neighbors (anti-storm protected; trusted callers only)
+    flood_timeout = min(timeout, 6.0) if env.get("action") == "ping" else min(timeout, 15.0)
     errors: list[str] = []
     for p_alias, p_cfg in peers.items():
-        if p_alias in tried_hops or _peer_in_via(p_alias, p_cfg, via):
+        if p_alias in tried_hops or _peer_in_via(p_alias, p_cfg, via_ids):
             continue
-        resp = _send_to_peer(p_alias, p_cfg, fwd_env, timeout=timeout)
+        resp = _send_to_peer(p_alias, p_cfg, {**fwd_env, "hop_timeout": max(1.5, flood_timeout - 1.0)}, timeout=flood_timeout)
         if resp.get("ok") or resp.get("reached_dst"):
             _learn_route(dst, p_alias, resp)
             return resp
@@ -2109,7 +2560,7 @@ def route_envelope(env: dict, timeout: float = 120.0) -> dict:
     with _REV_LOCK:
         rev_candidates = list(_REV_PEERS.values())
     for rs in rev_candidates:
-        if rs.alias in tried_hops or rs.alias in via or rs.node_id in via:
+        if rs.alias in tried_hops or rs.node_id in via_ids:
             continue
         if time.time() - rs.last_seen > 90.0:
             continue
@@ -2123,9 +2574,15 @@ def route_envelope(env: dict, timeout: float = 120.0) -> dict:
     return {"ok": False, "error": f"no route to '{dst}' ({detail})"}
 
 
-def send_action(dst: str, action: str, params: dict | None = None, timeout: float = 120.0) -> dict:
+def send_action(
+    dst: str,
+    action: str,
+    params: dict | None = None,
+    timeout: float = 120.0,
+    dst_port: int | None = None,
+) -> dict:
     state = load_router_state()
-    env = {
+    env: dict = {
         "v": 1,
         "pkt_id": str(uuid.uuid4()),
         "ttl": DEFAULT_TTL,
@@ -2135,27 +2592,76 @@ def send_action(dst: str, action: str, params: dict | None = None, timeout: floa
         "origin": state["origin"],
         "action": action,
         "params": params or {},
+        "hop_timeout": max(1.5, float(timeout) - 1.5),
+        "_local_origin": True,
     }
+    if dst_port is not None:
+        env["dst_port"] = int(dst_port)
     return route_envelope(env, timeout=timeout)
 
 
 def connect_peer_local(
     alias: str,
-    endpoint: str,
+    endpoint: str = "",
     token: str = "",
     bootstrap: bool = False,
     remote_path: str = "",
     ssh_port: int | None = None,
+    relay: str = "",
+    candidate_ports: list[int] | str | None = None,
 ) -> dict:
-    """Establish a direct connection from THIS node to `endpoint` and save peer edge."""
-    ep = endpoint.strip()
-    if ep.startswith(("http://", "https://")):
+    """Establish a direct (or zero-knowledge E2E blind-relayed) connection from THIS node to `endpoint`."""
+    ep = (endpoint or "").strip()
+    relay_s = (relay or "").strip()
+    cand_ports = _parse_port_list(candidate_ports, DEFAULT_CANDIDATE_PORTS) if candidate_ports else []
+
+    if relay_s:
+        if not token:
+            raise ValueError(f"--relay connection to '{alias}' requires target's --token <TOKEN>")
+        is_url = ep.startswith(("http://", "https://"))
         peer_entry: dict = {
+            "alias": alias,
+            "type": "e2e_relay",
+            "relay": relay_s,
+            "remote_dst": alias if (is_url or not ep) else ep,
+            "dst_url": ep.rstrip("/") if is_url else "",
+            "token": token,
+        }
+        if cand_ports:
+            peer_entry["candidate_ports"] = cand_ports
+        probe_env = {
+            "v": 1,
+            "pkt_id": str(uuid.uuid4()),
+            "ttl": DEFAULT_TTL,
+            "src": load_router_state()["node_id"],
+            "dst": peer_entry["remote_dst"],
+            "via": [],
+            "action": "ping",
+            "params": {},
+        }
+        resp = send_via_e2e_relay(peer_entry, probe_env, timeout=15.0)
+        if not resp.get("ok"):
+            raise RuntimeError(
+                f"failed to connect E2E blind-relay peer '{alias}' via '{relay_s}': {resp.get('error')}"
+            )
+        info = resp.get("result") or {}
+        peer_entry.update(
+            {
+                "node_id": info.get("node_id") or resp.get("node_id") or "",
+                "hostname": info.get("hostname", ""),
+                "platform": info.get("platform", ""),
+                "cwd": info.get("cwd", ""),
+            }
+        )
+    elif ep.startswith(("http://", "https://")):
+        peer_entry = {
             "alias": alias,
             "type": "http",
             "url": ep.rstrip("/"),
             "token": token,
         }
+        if cand_ports:
+            peer_entry["candidate_ports"] = cand_ports
         probe_env = {
             "v": 1,
             "pkt_id": str(uuid.uuid4()),
@@ -2279,12 +2785,13 @@ def load_or_create_daemon_token(token_file: Path | None = None) -> str:
     if token_file:
         tf = token_file
     else:
-        # Prefer agent.token in same directory as the script (for legacy agent.py deployments)
-        local_tf = Path(__file__).resolve().parent / "agent.token"
-        if local_tf.exists():
-            tok = local_tf.read_text(encoding="utf-8").strip()
-            if tok:
-                return tok
+        # Prefer agent.token in same directory as effective script (for legacy agent.py deployments)
+        for cand_dir in (_EFFECTIVE_SCRIPT_PATH.parent, Path(__file__).resolve().parent):
+            local_tf = cand_dir / "agent.token"
+            if local_tf.exists():
+                tok = local_tf.read_text(encoding="utf-8").strip()
+                if tok:
+                    return tok
         tf = get_state_dir() / "agent.token"
     if tf.exists():
         tok = tf.read_text(encoding="utf-8").strip()
@@ -2294,6 +2801,219 @@ def load_or_create_daemon_token(token_file: Path | None = None) -> str:
     tf.parent.mkdir(parents=True, exist_ok=True)
     tf.write_text(tok, encoding="utf-8")
     return tok
+
+
+class ExclusiveThreadingHTTPServer(ThreadingHTTPServer):
+    """Strict single-owner HTTP server (prevents Windows SO_REUSEADDR double-bind hijacking)."""
+
+    daemon_threads = True
+    allow_reuse_address = not IS_WINDOWS
+
+    def server_bind(self) -> None:
+        if IS_WINDOWS and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            with contextlib.suppress(Exception):
+                self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+
+_LISTEN_LOCK = threading.Lock()
+_LISTENERS: dict[int, tuple[ExclusiveThreadingHTTPServer, threading.Thread]] = {}
+_LISTENER_HOST: str = "0.0.0.0"
+
+_RELAY_FAIL_LOCK = threading.Lock()
+_RELAY_FAILS: dict[str, list[float]] = {}
+MAX_STRANGER_BODY_BYTES = 2 * 1024 * 1024
+
+
+def get_active_listen_ports() -> list[int]:
+    with _LISTEN_LOCK:
+        return sorted(_LISTENERS.keys())
+
+
+def _can_bind_exclusive(host: str, port: int) -> bool:
+    family = socket.AF_INET6 if ":" in host else socket.AF_INET
+    s = socket.socket(family, socket.SOCK_STREAM)
+    try:
+        if IS_WINDOWS and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        elif not IS_WINDOWS:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind((host, int(port)))
+        return True
+    except OSError:
+        return False
+    finally:
+        with contextlib.suppress(Exception):
+            s.close()
+
+
+def _bind_listener_port(host: str, port: int, token: str) -> ExclusiveThreadingHTTPServer:
+    p = int(port)
+    with _LISTEN_LOCK:
+        if p in _LISTENERS:
+            return _LISTENERS[p][0]
+        NodeHTTPHandler.daemon_token = token
+        srv = ExclusiveThreadingHTTPServer((host, p), NodeHTTPHandler)
+        t = threading.Thread(
+            target=srv.serve_forever,
+            kwargs={"poll_interval": 0.2},
+            name=f"rmcp-http-{p}",
+            daemon=True,
+        )
+        t.start()
+        _LISTENERS[p] = (srv, t)
+        return srv
+
+
+def _close_listener_port(port: int) -> bool:
+    p = int(port)
+    with _LISTEN_LOCK:
+        entry = _LISTENERS.pop(p, None)
+    if entry is None:
+        return False
+    srv, t = entry
+    with contextlib.suppress(Exception):
+        srv.shutdown()
+    with contextlib.suppress(Exception):
+        srv.server_close()
+    with contextlib.suppress(Exception):
+        t.join(timeout=2.0)
+    return True
+
+
+def _is_relay_rate_limited(client_ip: str) -> bool:
+    now = time.time()
+    cutoff = now - 60.0
+    with _RELAY_FAIL_LOCK:
+        hits = [ts for ts in (_RELAY_FAILS.get(client_ip) or []) if ts > cutoff]
+        if hits:
+            _RELAY_FAILS[client_ip] = hits
+        else:
+            _RELAY_FAILS.pop(client_ip, None)
+        return len(hits) >= 12
+
+
+def _record_relay_auth_failure(client_ip: str) -> None:
+    now = time.time()
+    cutoff = now - 60.0
+    with _RELAY_FAIL_LOCK:
+        hits = [ts for ts in (_RELAY_FAILS.get(client_ip) or []) if ts > cutoff]
+        hits.append(now)
+        _RELAY_FAILS[client_ip] = hits
+
+
+def _handle_local_relay_config(params: dict) -> dict:
+    global _RUNTIME_RELAY_POLICY
+    spec = str(params.get("spec") or "status").strip()
+    ports_raw = params.get("ports")
+    if spec.lower() == "status" and not ports_raw:
+        return {"ok": True, "relay_policy": get_effective_relay_policy()}
+    with _STATE_LOCK:
+        topo = load_topology_state()
+        cur = get_effective_relay_policy(topo)
+        eff_spec = cur["mode"] if spec.lower() == "status" else spec
+        if eff_spec == "cidr":
+            eff_spec = ",".join(cur.get("cidrs") or PRIVATE_RELAY_CIDRS)
+        updated = parse_relay_spec(eff_spec, ports_raw=ports_raw, base=cur)
+        topo["relay_policy"] = updated
+        save_topology_state(topo)
+        if _RUNTIME_RELAY_POLICY is not None:
+            _RUNTIME_RELAY_POLICY = dict(updated)
+    return {"ok": True, "relay_policy": updated}
+
+
+def _handle_upgrade_prepare_reclaim(params: dict) -> dict:
+    """On Green instance: atomically promote staged script to install_path & start fast primary-port reclaim."""
+    global _EFFECTIVE_SCRIPT_PATH
+    install_raw = str(params.get("install_path") or "").strip()
+    stage_raw = str(params.get("stage_path") or str(Path(__file__).resolve())).strip()
+    reclaim_port = int(params["reclaim_port"])
+    green_port = int(params.get("green_port") or 0)
+    host = str(params.get("host") or _LISTENER_HOST or "0.0.0.0")
+
+    stage_p = Path(stage_raw).resolve()
+    if install_raw:
+        install_p = Path(install_raw).resolve()
+        install_p.parent.mkdir(parents=True, exist_ok=True)
+        new_bytes = stage_p.read_bytes()
+        if install_p.exists():
+            bak_p = install_p.with_name(install_p.name + ".bak")
+            with contextlib.suppress(Exception):
+                bak_tmp = bak_p.with_name(bak_p.name + f".tmp.{os.getpid()}")
+                bak_tmp.write_bytes(install_p.read_bytes())
+                os.replace(bak_tmp, bak_p)
+        tmp_p = install_p.with_name(install_p.name + f".upg.{os.getpid()}")
+        tmp_p.write_bytes(new_bytes)
+        if not IS_WINDOWS:
+            with contextlib.suppress(Exception):
+                tmp_p.chmod(0o755)
+        os.replace(tmp_p, install_p)
+        _EFFECTIVE_SCRIPT_PATH = install_p
+
+    tok = _get_local_node_secret()
+
+    def _reclaim_worker() -> None:
+        deadline = time.time() + 20.0
+        reclaimed = False
+        while time.time() < deadline:
+            if reclaim_port in get_active_listen_ports():
+                reclaimed = True
+                break
+            try:
+                _bind_listener_port(host, reclaim_port, tok)
+                reclaimed = True
+                break
+            except OSError:
+                time.sleep(0.10)
+        if reclaimed and green_port and green_port != reclaim_port:
+            # Safety auto-release: if caller disconnects before upgrade_finalize, free candidate port after 30s
+            def _auto_release() -> None:
+                time.sleep(30.0)
+                if reclaim_port in get_active_listen_ports():
+                    _close_listener_port(green_port)
+
+            threading.Thread(target=_auto_release, daemon=True).start()
+
+    threading.Thread(target=_reclaim_worker, name=f"rmcp-reclaim-{reclaim_port}", daemon=True).start()
+    return {
+        "ok": True,
+        "pid": os.getpid(),
+        "code_hash": CODE_HASH,
+        "script_path": str(_EFFECTIVE_SCRIPT_PATH),
+        "reclaim_port": reclaim_port,
+    }
+
+
+def _handle_upgrade_finalize(params: dict) -> dict:
+    """Release temporary Green candidate port & clean up staging artifacts once primary port is verified."""
+    release_port = int(params.get("release_port") or 0)
+    primary_port = int(params.get("primary_port") or 0)
+    stage_path = str(params.get("stage_path") or "").strip()
+    stage_log = str(params.get("stage_log") or "").strip()
+
+    active = get_active_listen_ports()
+    if primary_port and primary_port not in active:
+        raise RuntimeError(f"cannot finalize: primary port {primary_port} is not active (active={active})")
+
+    if release_port and release_port != primary_port and release_port in active:
+        _close_listener_port(release_port)
+
+    def _cleanup_files() -> None:
+        time.sleep(0.2)
+        for sp in (stage_path, stage_log):
+            if sp:
+                p = Path(sp)
+                if p.exists() and p.resolve() != _EFFECTIVE_SCRIPT_PATH.resolve():
+                    with contextlib.suppress(Exception):
+                        p.unlink()
+
+    threading.Thread(target=_cleanup_files, daemon=True).start()
+    return {
+        "ok": True,
+        "pid": os.getpid(),
+        "code_hash": CODE_HASH,
+        "active_ports": get_active_listen_ports(),
+    }
 
 
 class NodeHTTPHandler(BaseHTTPRequestHandler):
@@ -2363,10 +3083,58 @@ class NodeHTTPHandler(BaseHTTPRequestHandler):
             self._send_json(500, {"error": f"{type(e).__name__}: {e}"})
 
     def do_POST(self) -> None:  # noqa: N802
-        if not self._authed():
-            self._send_json(401, {"error": "unauthorized"})
-            return
         path_only = self.path.split("?", 1)[0]
+        if not self._authed():
+            if path_only != "/route":
+                self._send_json(401, {"error": "unauthorized"})
+                return
+            client_ip = self.client_address[0]
+            if _is_relay_rate_limited(client_ip):
+                self._send_json(429, {"ok": False, "error": "too many failed relay/auth attempts"})
+                return
+            body_len = int(self.headers.get("Content-Length", "0") or "0")
+            if body_len <= 0 or body_len > MAX_STRANGER_BODY_BYTES:
+                self._send_json(413, {"ok": False, "error": "invalid or oversized stranger /route payload"})
+                return
+            try:
+                env = self._read_json()
+            except Exception:
+                _record_relay_auth_failure(client_ip)
+                self._send_json(400, {"ok": False, "error": "malformed JSON"})
+                return
+            if not isinstance(env, dict) or not isinstance(env.get("e2e"), dict):
+                _record_relay_auth_failure(client_ip)
+                self._send_json(401, {"ok": False, "error": "unauthorized"})
+                return
+
+            # Strip any untrusted plaintext command fields; require cryptographic E2E box
+            for k in ("action", "params", "enc", "origin"):
+                env.pop(k, None)
+            env["action"] = "_e2e"
+            env["untrusted_relay"] = True
+
+            topo = load_topology_state()
+            dst = str(env.get("dst") or "self")
+            is_transit = (not _is_local_target(dst, topo)) or bool(str(env.get("dst_url") or "").strip())
+            if is_transit and get_effective_relay_policy(topo)["mode"] == "off":
+                _record_relay_auth_failure(client_ip)
+                self._send_json(
+                    403,
+                    {
+                        "ok": False,
+                        "error": "stranger blind relay is disabled on this node (enable with --allow-relay peers|private)",
+                    },
+                )
+                return
+
+            resp = route_envelope(env)
+            if resp.get("e2e_auth_failed"):
+                _record_relay_auth_failure(client_ip)
+                self._send_json(401, resp)
+            else:
+                self._send_json(200, resp)
+            return
+
         try:
             if path_only == "/route":
                 env = self._read_json()
@@ -2471,19 +3239,87 @@ class NodeHTTPHandler(BaseHTTPRequestHandler):
             self._send_json(500, {"error": f"{type(e).__name__}: {e}"})
 
 
-def run_http_listener(host: str = "0.0.0.0", port: int = 7777, token: str = "") -> None:
+def _probe_local_listener_alive(port: int) -> bool:
+    code, res = _http_request_json(f"http://127.0.0.1:{int(port)}/ping", "GET", "", timeout=1.5)
+    return code == 200 and isinstance(res, dict) and bool(res.get("ok"))
+
+
+def run_http_listener(
+    host: str = "0.0.0.0",
+    port: int = 7777,
+    token: str = "",
+    allow_relay: str = "",
+    relay_ports: str = "",
+    script_path_override: str = "",
+    standby_if_busy: bool = False,
+) -> None:
+    global _EFFECTIVE_SCRIPT_PATH, _LISTENER_HOST, _RUNTIME_RELAY_POLICY
+    if script_path_override:
+        _EFFECTIVE_SCRIPT_PATH = Path(script_path_override).resolve()
+    _LISTENER_HOST = host
+
+    if allow_relay or relay_ports:
+        with _STATE_LOCK:
+            topo = load_topology_state()
+            base_pol = topo.get("relay_policy")
+            eff_spec = allow_relay or (base_pol or {}).get("mode", "off")
+            if eff_spec == "cidr":
+                eff_spec = ",".join((base_pol or {}).get("cidrs") or PRIVATE_RELAY_CIDRS)
+            pol = parse_relay_spec(eff_spec, ports_raw=relay_ports or None, base=base_pol)
+            _RUNTIME_RELAY_POLICY = pol
+            topo["relay_policy"] = pol
+            save_topology_state(topo)
+
     tok = token or load_or_create_daemon_token()
-    state = load_router_state()
     NodeHTTPHandler.daemon_token = tok
-    srv = ThreadingHTTPServer((host, port), NodeHTTPHandler)
+
+    try:
+        _bind_listener_port(host, port, tok)
+    except OSError:
+        if not standby_if_busy or not _probe_local_listener_alive(port):
+            raise
+        if sys.stdout is not None:
+            print(
+                f"[rmcp] port {port} already served by active instance; standing by quietly",
+                flush=True,
+            )
+        while True:
+            time.sleep(5.0)
+            if _probe_local_listener_alive(port):
+                continue
+            # Give any active Blue-Green fast reclaim (0.10s interval) a 3.0s head start!
+            down = True
+            for _ in range(6):
+                time.sleep(0.5)
+                if _probe_local_listener_alive(port):
+                    down = False
+                    break
+            if not down:
+                continue
+            # If on-disk script was upgraded since standby started, exit so supervisor launches new file
+            if compute_code_hash(_EFFECTIVE_SCRIPT_PATH) != CODE_HASH:
+                return
+            try:
+                _bind_listener_port(host, port, tok)
+                break
+            except OSError:
+                continue
+
+    state = load_router_state()
+    rpol = get_effective_relay_policy(state)
     if sys.stdout is not None:
-        print(f"[rmcp] node={state['node_id']} alias={state['alias']} v{VERSION}", flush=True)
-        print(f"[rmcp] listening on http://{host}:{port}", flush=True)
+        print(
+            f"[rmcp] node={state['node_id']} alias={state['alias']} v{VERSION} ({CODE_HASH})",
+            flush=True,
+        )
+        print(f"[rmcp] listening on http://{host}:{port} (relay={rpol['mode']})", flush=True)
         print(f"[rmcp] token: {tok}", flush=True)
     try:
-        srv.serve_forever()
+        while get_active_listen_ports():
+            time.sleep(0.5)
     except KeyboardInterrupt:
-        srv.shutdown()
+        for lp in get_active_listen_ports():
+            _close_listener_port(lp)
 
 
 # ---------------------------------------------------------------------------
@@ -2650,6 +3486,8 @@ _MGMT_COMMANDS = {
     "rm",
     "dial",
     "listen",
+    "relay",
+    "upgrade",
     "autostart",
     "ping",
     "env",
@@ -2732,6 +3570,421 @@ def _spawn_detached_self(child_args: list[str], log_path: Path) -> int:
         kwargs["start_new_session"] = True
     proc = subprocess.Popen([exe, str(Path(__file__).resolve()), *child_args], **kwargs)
     return proc.pid
+
+
+def _upload_bytes_to_target(
+    target: str,
+    raw_bytes: bytes,
+    remote_path: str,
+    cwd: str | None = None,
+    timeout: float = 90.0,
+) -> dict:
+    size = len(raw_bytes)
+    expected_sha = hashlib.sha256(raw_bytes).hexdigest()
+    offset = 0
+    upload_id = secrets.token_hex(6)
+    with persistent_stdio_context():
+        while True:
+            chunk = raw_bytes[offset : offset + STREAM_CHUNK]
+            eof = (offset + len(chunk)) >= size
+            resp = send_action(
+                target,
+                "upload_chunk",
+                {
+                    "path": remote_path,
+                    "cwd": cwd,
+                    "upload_id": upload_id,
+                    "offset": offset,
+                    "data_b64": base64.b64encode(chunk).decode("ascii"),
+                    "finalize": eof,
+                    "sha256": expected_sha if eof else None,
+                },
+                timeout=timeout,
+            )
+            if not resp.get("ok"):
+                return {"ok": False, "error": f"upload failed at offset {offset}: {resp.get('error')}"}
+            offset += len(chunk)
+            if eof:
+                return {"ok": True, "sha256": expected_sha, "result": resp.get("result") or {}}
+
+
+def _discover_target_daemon_layout(
+    target: str,
+    pinfo: dict,
+    via: list[str],
+    state: dict,
+) -> dict:
+    """Resolve whether `target` is an HTTP daemon vs stdio peer, plus python/script_path/primary_port."""
+    py_exe = str(pinfo.get("python") or "").strip()
+    script_path = str(pinfo.get("script_path") or "").strip()
+    listen_ports = pinfo.get("listen_ports")
+    listen_host = str(pinfo.get("listen_host") or "0.0.0.0")
+
+    # Determine peer config locally or on penultimate hop (for v0.7 / v0.4 compatibility)
+    peer_cfg = (state.get("peers") or {}).get(target)
+    penultimate_hop = via[-2] if len(via) >= 2 else ""
+    if not peer_cfg and penultimate_hop and not _is_local_target(penultimate_hop, state):
+        hop_ping = send_action(penultimate_hop, "ping", {}, timeout=15.0)
+        hop_info = (hop_ping.get("result") or {}) if hop_ping.get("ok") else {}
+        hop_list = send_action(penultimate_hop, "peers_list", {}, timeout=15.0)
+        if hop_list.get("ok"):
+            peer_cfg = ((hop_list.get("result") or {}).get("peers") or {}).get(target)
+        if peer_cfg and peer_cfg.get("type") in ("http", "e2e_relay") and not hop_info.get("code_hash"):
+            return {
+                "error": (
+                    f"intermediate hop '{penultimate_hop}' is running v{hop_info.get('version', 'old')} (< 0.8.0); "
+                    f"upgrade '{penultimate_hop}' first (or run `rmcp :upgrade --all`) so it can probe candidate ports"
+                )
+            }
+
+    if isinstance(listen_ports, list):
+        is_http = len(listen_ports) > 0
+        primary_port = int(listen_ports[0]) if is_http else 0
+        # Prefer configured primary port from peer URL if node currently holds multiple ports
+        if is_http and peer_cfg:
+            u = peer_cfg.get("url") or peer_cfg.get("dst_url") or ""
+            if u:
+                up = urllib.parse.urlsplit(str(u)).port
+                if up:
+                    primary_port = int(up)
+    else:
+        ptype = (peer_cfg or {}).get("type", "")
+        is_http = ptype in ("http", "e2e_relay")
+        u = (peer_cfg or {}).get("url") or (peer_cfg or {}).get("dst_url") or ""
+        primary_port = int(urllib.parse.urlsplit(str(u)).port or 7777) if is_http else 0
+
+    if not py_exe:
+        env_resp = send_action(target, "env", {}, timeout=15.0)
+        if env_resp.get("ok"):
+            py_exe = str(((env_resp.get("result") or {}).get("python") or {}).get("executable") or "")
+    if not py_exe:
+        py_exe = "python" if pinfo.get("is_windows") else "python3"
+
+    if not script_path:
+        if not is_http and peer_cfg and peer_cfg.get("remote_path"):
+            rp = str(peer_cfg["remote_path"])
+            if rp.startswith("~"):
+                env_resp = send_action(target, "env", {}, timeout=15.0)
+                home = str((env_resp.get("result") or {}).get("home") or "")
+                if home:
+                    rp = home.rstrip("/\\") + "/" + rp[2:]
+            script_path = rp
+        else:
+            cwd = str(pinfo.get("cwd") or "")
+            probe_one = (
+                f'"{py_exe}" -c "import pathlib; cwd=pathlib.Path(r\'{cwd}\'); '
+                "cands=[cwd/'agent.py',cwd/'rmcp.py',pathlib.Path.home()/'.rmcp'/'rmcp.py']; "
+                "found=[str(p) for p in cands if p.is_file()]; "
+                "print('RMCP_SP:'+(found[0] if found else str(cwd/'rmcp.py')))\""
+            )
+            ex = send_action(target, "exec", {"command": probe_one, "timeout": 10}, timeout=15.0)
+            out_txt = str(((ex.get("result") or {}).get("stdout")) or "")
+            for ln in out_txt.splitlines():
+                if "RMCP_SP:" in ln:
+                    script_path = ln.split("RMCP_SP:", 1)[1].strip()
+                    break
+            if not script_path:
+                sep = "\\" if pinfo.get("is_windows") else "/"
+                script_path = f"{cwd.rstrip('/\\')}{sep}agent.py" if cwd else "~/.rmcp/rmcp.py"
+
+    return {
+        "is_http": is_http,
+        "primary_port": primary_port,
+        "listen_host": listen_host,
+        "py_exe": py_exe,
+        "script_path": script_path,
+    }
+
+
+def _upgrade_single_target(
+    target: str,
+    candidate_ports: list[int],
+    force: bool = False,
+    state: dict | None = None,
+) -> dict:
+    """Blue-Green upgrade `target` with external verification gate and primary-port reclaim."""
+    st = state or load_router_state()
+    if _is_local_target(target, st):
+        return {
+            "ok": True,
+            "target": target,
+            "status": "local_self",
+            "version": VERSION,
+            "code_hash": CODE_HASH,
+        }
+
+    ping_resp = send_action(target, "ping", {}, timeout=20.0)
+    if not ping_resp.get("ok"):
+        return {"ok": False, "target": target, "error": f"unreachable: {ping_resp.get('error')}"}
+
+    pinfo = ping_resp.get("result") or {}
+    via = list(ping_resp.get("via") or [target])
+    old_version = str(pinfo.get("version") or "unknown")
+    old_hash = str(pinfo.get("code_hash") or "")
+    blue_pid = int(pinfo.get("pid") or 0)
+    is_win = bool(pinfo.get("is_windows") or str(pinfo.get("platform", "")).startswith("win"))
+
+    layout = _discover_target_daemon_layout(target, pinfo, via, st)
+    if layout.get("error"):
+        return {"ok": False, "target": target, "error": layout["error"]}
+
+    is_http = bool(layout["is_http"])
+    primary_port = int(layout["primary_port"])
+    listen_host = str(layout["listen_host"])
+    py_exe = str(layout["py_exe"])
+    install_path = str(layout["script_path"])
+
+    if not force and old_hash == CODE_HASH:
+        if not is_http or primary_port in (pinfo.get("listen_ports") or [primary_port]):
+            return {
+                "ok": True,
+                "target": target,
+                "status": "up_to_date",
+                "version": old_version,
+                "code_hash": old_hash,
+                "pid": blue_pid,
+                "port": primary_port if is_http else None,
+                "install_path": install_path,
+            }
+
+    my_bytes = Path(__file__).resolve().read_bytes()
+
+    # Path A: SSH / local:// stdio peer (no persistent HTTP listener port to swap)
+    if not is_http:
+        stage_path = f"{install_path}.stage.{CODE_HASH}.py"
+        up = _upload_bytes_to_target(target, my_bytes, stage_path)
+        if not up.get("ok"):
+            return {"ok": False, "target": target, "error": up.get("error")}
+
+        q_py = f'"{py_exe}"' if " " in py_exe else py_exe
+        ver_cmd = f'{q_py} "{stage_path}" --version'
+        ver_res = send_action(target, "exec", {"command": ver_cmd, "timeout": 15}, timeout=20.0)
+        ver_out = str(((ver_res.get("result") or {}).get("stdout")) or "").strip()
+        if not ver_res.get("ok") or (ver_res.get("result") or {}).get("exit_code") != 0 or VERSION not in ver_out:
+            send_action(
+                target,
+                "exec",
+                {"command": f'{q_py} -c "import pathlib; pathlib.Path(r\'{stage_path}\').unlink(missing_ok=True)"'},
+                timeout=10.0,
+            )
+            return {
+                "ok": False,
+                "target": target,
+                "rolled_back": True,
+                "error": f"staged Green syntax/version check failed: {ver_out or ver_res.get('error')}",
+            }
+
+        swap_cmd = (
+            f'{q_py} -c "import os,pathlib,shutil; '
+            f"s=pathlib.Path(r'{stage_path}'); d=pathlib.Path(r'{install_path}'); "
+            "(shutil.copy2(d, str(d)+'.bak') if d.exists() else None); "
+            "os.replace(s, d); print('RMCP_SWAP_OK')\""
+        )
+        sw_res = send_action(target, "exec", {"command": swap_cmd, "timeout": 15}, timeout=20.0)
+        sw_out = str(((sw_res.get("result") or {}).get("stdout")) or "")
+        if not sw_res.get("ok") or "RMCP_SWAP_OK" not in sw_out:
+            return {"ok": False, "target": target, "error": f"atomic swap failed: {sw_out or sw_res.get('error')}"}
+
+        close_all_stdio_sessions()
+        verify_ping = send_action(target, "ping", {}, timeout=20.0)
+        vinfo = verify_ping.get("result") or {}
+        if not verify_ping.get("ok") or vinfo.get("code_hash") != CODE_HASH:
+            return {
+                "ok": False,
+                "target": target,
+                "error": f"post-swap verification mismatch: {verify_ping}",
+            }
+        return {
+            "ok": True,
+            "target": target,
+            "status": "upgraded",
+            "mode": "staged-stdio",
+            "old_version": old_version,
+            "old_hash": old_hash,
+            "new_version": vinfo.get("version"),
+            "new_hash": vinfo.get("code_hash"),
+            "install_path": install_path,
+            "via": verify_ping.get("via") or via,
+        }
+
+    # Path B: HTTP Daemon Blue-Green Upgrade + Primary Port Reclaim
+    cands = [p for p in candidate_ports if p != primary_port]
+    if not cands:
+        return {"ok": False, "target": target, "error": f"no candidate ports distinct from primary port {primary_port}"}
+
+    green_port = 0
+    if old_hash:
+        pf = send_action(target, "pick_free_port", {"host": listen_host, "candidates": cands}, timeout=10.0)
+        if not pf.get("ok"):
+            return {"ok": False, "target": target, "error": f"pick_free_port failed: {pf.get('error')}"}
+        green_port = int((pf.get("result") or {}).get("port") or 0)
+    else:
+        q_py = f'"{py_exe}"' if " " in py_exe else py_exe
+        probe_port_cmd = (
+            f'{q_py} -c "import socket; cands={cands!r}; '
+            "free=[]; "
+            "[((s:=socket.socket()), s.bind(('0.0.0.0', p)), s.close(), free.append(p)) for p in cands if not free]; "
+            "print('RMCP_FREE:' + (str(free[0]) if free else '0'))\""
+        )
+        pr = send_action(target, "exec", {"command": probe_port_cmd, "timeout": 10}, timeout=15.0)
+        for ln in str(((pr.get("result") or {}).get("stdout")) or "").splitlines():
+            if "RMCP_FREE:" in ln:
+                with contextlib.suppress(ValueError):
+                    green_port = int(ln.split("RMCP_FREE:", 1)[1].strip())
+        if not green_port:
+            green_port = cands[0]
+
+    sep = "\\" if (is_win and "\\" in install_path) else "/"
+    install_dir = install_path.rsplit(sep, 1)[0] if sep in install_path else "."
+    stage_path = f"{install_dir}{sep}.rmcp.stage.{CODE_HASH}.{green_port}.py"
+    stage_log = f"{install_dir}{sep}.rmcp.green.{green_port}.log"
+
+    up = _upload_bytes_to_target(target, my_bytes, stage_path)
+    if not up.get("ok"):
+        return {"ok": False, "target": target, "error": up.get("error")}
+
+    green_cmd = (
+        f'"{py_exe}" "{stage_path}" --listen --host {listen_host} '
+        f'--port {green_port} --script-path "{install_path}"'
+    )
+    sp_resp = send_action(
+        target,
+        "spawn",
+        {"command": green_cmd, "cwd": install_dir, "stdout": stage_log, "stderr": stage_log},
+        timeout=15.0,
+    )
+    if not sp_resp.get("ok"):
+        return {"ok": False, "target": target, "blue_intact": True, "error": f"spawn Green failed: {sp_resp.get('error')}"}
+    spawned_pid = int((sp_resp.get("result") or {}).get("pid") or 0)
+
+    # External End-to-End Verification Gate on green_port BEFORE touching Blue!
+    green_verified_pid = 0
+    last_green_err = ""
+    deadline = time.time() + 9.0
+    while time.time() < deadline:
+        time.sleep(0.25)
+        gp = send_action(target, "ping", {}, timeout=3.0, dst_port=green_port)
+        if gp.get("ok"):
+            gi = gp.get("result") or {}
+            gpid = int(gi.get("pid") or 0)
+            if gi.get("code_hash") == CODE_HASH and gpid != blue_pid:
+                green_verified_pid = gpid
+                break
+            last_green_err = f"unexpected instance on port {green_port}: pid={gpid}, hash={gi.get('code_hash')}"
+        else:
+            last_green_err = str(gp.get("error") or "unreachable")
+
+    if not green_verified_pid:
+        log_tail = ""
+        lg = send_action(target, "read", {"path": stage_log}, timeout=5.0)
+        if lg.get("ok"):
+            log_tail = base64.b64decode((lg.get("result") or {}).get("data_b64", "")).decode("utf-8", errors="replace")[-500:]
+        if spawned_pid:
+            send_action(target, "kill", {"pid": spawned_pid, "signal": "KILL"}, timeout=8.0)
+        return {
+            "ok": False,
+            "target": target,
+            "rolled_back": True,
+            "blue_intact": True,
+            "candidate_port_tried": green_port,
+            "error": f"Green verification failed on port {green_port} ({last_green_err}); Blue on :{primary_port} untouched",
+            "green_log": log_tail.strip(),
+        }
+
+    # Green is verified end-to-end! Promote staged file & arm fast port-reclaim loop on Green
+    prep = send_action(
+        target,
+        "upgrade_prepare_reclaim",
+        {
+            "install_path": install_path,
+            "stage_path": stage_path,
+            "reclaim_port": primary_port,
+            "green_port": green_port,
+            "host": listen_host,
+        },
+        timeout=15.0,
+        dst_port=green_port,
+    )
+    if not prep.get("ok"):
+        if spawned_pid:
+            send_action(target, "kill", {"pid": spawned_pid, "signal": "KILL"}, timeout=8.0)
+        return {
+            "ok": False,
+            "target": target,
+            "rolled_back": True,
+            "blue_intact": True,
+            "error": f"upgrade_prepare_reclaim failed on Green: {prep.get('error')}",
+        }
+
+    # Shut down Blue on primary_port (Green reclaims primary_port within ~100-200ms)
+    send_action(
+        target,
+        "shutdown",
+        {"delay": 0.12, "close_listeners": True},
+        timeout=8.0,
+        dst_port=primary_port,
+    )
+
+    reclaimed_ok = False
+    final_via = via
+    reclaim_deadline = time.time() + 14.0
+    while time.time() < reclaim_deadline:
+        time.sleep(0.15)
+        rp = send_action(target, "ping", {}, timeout=3.0, dst_port=primary_port)
+        if rp.get("ok"):
+            ri = rp.get("result") or {}
+            if (
+                int(ri.get("pid") or 0) == green_verified_pid
+                and ri.get("code_hash") == CODE_HASH
+                and primary_port in (ri.get("listen_ports") or [primary_port])
+            ):
+                reclaimed_ok = True
+                final_via = list(rp.get("via") or via)
+                break
+
+    if not reclaimed_ok:
+        return {
+            "ok": False,
+            "target": target,
+            "green_pid": green_verified_pid,
+            "fallback_port": green_port,
+            "error": (
+                f"Green (pid={green_verified_pid}) is alive on fallback port {green_port}, "
+                f"but did not reclaim primary port {primary_port} within 14s"
+            ),
+        }
+
+    # Primary port is verified end-to-end on Green! Release candidate port & clean staging files
+    send_action(
+        target,
+        "upgrade_finalize",
+        {
+            "release_port": green_port,
+            "primary_port": primary_port,
+            "stage_path": stage_path,
+            "stage_log": stage_log,
+        },
+        timeout=10.0,
+        dst_port=primary_port,
+    )
+
+    return {
+        "ok": True,
+        "target": target,
+        "status": "upgraded",
+        "mode": "blue-green-http",
+        "old_version": old_version,
+        "old_hash": old_hash,
+        "new_version": VERSION,
+        "new_hash": CODE_HASH,
+        "blue_pid": blue_pid,
+        "green_pid": green_verified_pid,
+        "primary_port": primary_port,
+        "candidate_port_used": green_port,
+        "reclaimed_primary_port": True,
+        "install_path": install_path,
+        "via": final_via,
+    }
 
 
 def _cli_upload(
@@ -2846,7 +4099,7 @@ def _cli_download(
 
 def _print_help() -> None:
     print(
-        f"""rmcp v{VERSION} — Unified Multi-Hop Mesh Router & CLI for remote-mcp
+        f"""rmcp v{VERSION} ({CODE_HASH}) — Unified Multi-Hop Mesh Router & CLI for remote-mcp
 
 Usage:
   rmcp                                    Start interactive REPL (in a TTY; prints help for bots)
@@ -2859,24 +4112,31 @@ Usage:
 Mesh & Routing Commands:
   :repl | :shell [target]                 Enter interactive REPL (inside REPL: :q / exit, !<cmd>)
   :local <command...>                     Run a command on THIS local machine without switching :use
-  :id                                     Show node_id, alias, and current caller origin/session
+  :id [--alias <name>] [--show-token]     Show node_id, code_hash, alias, and caller session
   :sessions [--clear|--clear-all]         List (or clear) isolated per-caller sessions on this host
   :nodes | :peers | :routes [target]      Show local (or remote node's) known peers & cached routes
-  :connect <alias> <endpoint> [options]   Connect & record a peer edge (SSH preferred, HTTP fallback)
-      Endpoints:  ssh://user@host[:port]  |  user@host  |  http://host:port
+  :connect <alias> [endpoint] [options]   Connect & record a peer edge (SSH, HTTP, or Blind Relay)
+      Endpoints:  ssh://user@host[:port]  |  user@host  |  http://host:port  |  <peer_name>
       Options:    --bootstrap             Copy rmcp.py to SSH host (~/.rmcp/rmcp.py) automatically
-                  --token <tok>           Shared token for HTTP endpoint
+                  --token <tok>           Shared token for HTTP / target node
                   --via <hop_node>        Ask <hop_node> to connect using ITS keys/network (multi-hop!)
+                  --relay <url_or_peer>   Zero-knowledge E2E blind relay (needs ONLY target --token!)
+                  --ports <p1,p2,...>     Candidate ports for HTTP failover (default: 7778,7779,7780)
                   --port <ssh_port>       Override SSH port
                   --remote-path <path>    Custom remote path for rmcp.py on SSH host
   :disconnect <alias> [--via <hop_node>]  Remove a recorded peer edge
   :use <target>                           Switch active target node (alias, node_id, or multi-hop peer)
   :ping [target]                          Probe target and display hop-by-hop `via` path
   :env [target]                           Inspect OS, shells, Python, disk & environment on target
+  :upgrade [target|--all] [--ports ...] [--force]
+                                          Blue-Green upgrade remote node(s) & reclaim primary port
 
-Daemon, Reverse-Tunnel & Self-Healing Commands (for SSH-less / NAT hosts):
-  :listen [--port 7777] [--host 0.0.0.0] [--token T] [--daemon] [--watchdog]
-                                          Listen as encrypted HTTP node + reverse-tunnel hub
+Daemon, Blind Relay & Self-Healing Commands (for SSH-less / NAT hosts):
+  :listen [--port 7777] [--host 0.0.0.0] [--token T] [--allow-relay <off|peers|private|CIDR,...>]
+          [--relay-ports 7777,7778,7779,7780] [--daemon] [--watchdog]
+                                          Listen as encrypted HTTP node + hub + optional blind relay
+  :relay [status|off|peers|private|<CIDR,...>] [--ports 7777,7778,7779,7780] [--local]
+                                          Inspect or update 2-tier stranger blind-relay policy
   :dial <hub_url> --token <T> [--alias A] [--daemon] [--watchdog]
                                           Dial outbound reverse connection to a hub (no inbound port!)
   :autostart [status|on|off] [--port 7777] [--dial <url> --token <T>] [--local]
@@ -2989,27 +4249,29 @@ def _handle_mgmt_command(cmd: str, args: list[str], explicit_to: str = "") -> in
         return _exec_remote_shell("self", cmd_str, state, exec_timeout=120.0, persist_cwd=False)
 
     if cmd in ("id", "whoami"):
-        if args and args[0] == "--alias" and len(args) >= 2:
+        show_tok, _, args = _pop_flag(args, "--show-token", False)
+        _, alias_new, args = _pop_flag(args, "--alias", True)
+        if alias_new:
             with _STATE_LOCK:
                 topo = load_topology_state()
-                topo["alias"] = args[1]
+                topo["alias"] = alias_new
                 save_topology_state(topo)
             state = load_router_state()
-        print(
-            json.dumps(
-                {
-                    "node_id": state["node_id"],
-                    "alias": state["alias"],
-                    "hostname": socket.gethostname(),
-                    "caller": state["caller"],
-                    "caller_key": state["caller_key"],
-                    "active": _resolve_active_target("", state),
-                    "state_dir": str(get_state_dir()),
-                },
-                indent=2,
-                ensure_ascii=False,
-            )
-        )
+        info_doc: dict = {
+            "version": VERSION,
+            "code_hash": CODE_HASH,
+            "node_id": state["node_id"],
+            "alias": state["alias"],
+            "hostname": socket.gethostname(),
+            "caller": state["caller"],
+            "caller_key": state["caller_key"],
+            "active": _resolve_active_target("", state),
+            "relay_policy": get_effective_relay_policy(state),
+            "state_dir": str(get_state_dir()),
+        }
+        if show_tok:
+            info_doc["token"] = load_or_create_daemon_token()
+        print(json.dumps(info_doc, indent=2, ensure_ascii=False))
         return 0
 
     if cmd == "sessions":
@@ -3052,11 +4314,14 @@ def _handle_mgmt_command(cmd: str, args: list[str], explicit_to: str = "") -> in
             print(json.dumps(resp, indent=2, ensure_ascii=False))
             return 0
         summary = {
+            "version": VERSION,
+            "code_hash": CODE_HASH,
             "node_id": state["node_id"],
             "alias": state["alias"],
             "caller": state["caller"],
             "caller_key": state["caller_key"],
             "active": _resolve_active_target("", state),
+            "relay_policy": get_effective_relay_policy(state),
             "peers": {
                 k: {pk: pv for pk, pv in v.items() if pk != "token"}
                 for k, v in (state.get("peers") or {}).items()
@@ -3071,14 +4336,20 @@ def _handle_mgmt_command(cmd: str, args: list[str], explicit_to: str = "") -> in
         has_boot, _, args = _pop_flag(args, "--bootstrap", False)
         _, token, args = _pop_flag(args, "--token", True)
         _, via_hop, args = _pop_flag(args, "--via", True)
+        _, relay_hop, args = _pop_flag(args, "--relay", True)
         _, rpath, args = _pop_flag(args, "--remote-path", True)
         _, port_s, args = _pop_flag(args, "--port", True)
+        _, cports_s, args = _pop_flag(args, "--ports", True)
         ssh_port = int(port_s) if port_s else None
+        cand_ports = _parse_port_list(cports_s, DEFAULT_CANDIDATE_PORTS) if cports_s else None
 
-        if len(args) < 2:
-            sys.stderr.write("Usage: rmcp :connect <alias> <endpoint> [--bootstrap] [--token T] [--via <hop>]\n")
+        if len(args) < 1 or (len(args) < 2 and not relay_hop):
+            sys.stderr.write(
+                "Usage: rmcp :connect <alias> [endpoint] [--bootstrap] [--token T] [--via <hop>] [--relay <relay>]\n"
+            )
             return 2
-        alias, endpoint = args[0], args[1]
+        alias = args[0]
+        endpoint = args[1] if len(args) >= 2 else ""
         hop = via_hop or explicit_to
         if hop and not _is_local_target(hop, state):
             resp = send_action(
@@ -3091,6 +4362,8 @@ def _handle_mgmt_command(cmd: str, args: list[str], explicit_to: str = "") -> in
                     "bootstrap": has_boot,
                     "remote_path": rpath,
                     "ssh_port": ssh_port,
+                    "relay": relay_hop,
+                    "candidate_ports": cand_ports,
                 },
                 timeout=90.0,
             )
@@ -3130,6 +4403,8 @@ def _handle_mgmt_command(cmd: str, args: list[str], explicit_to: str = "") -> in
                 bootstrap=has_boot,
                 remote_path=rpath,
                 ssh_port=ssh_port,
+                relay=relay_hop,
+                candidate_ports=cand_ports,
             )
             update_caller_session(
                 active=alias,
@@ -3189,12 +4464,19 @@ def _handle_mgmt_command(cmd: str, args: list[str], explicit_to: str = "") -> in
     if cmd == "listen":
         is_daemon, _, args = _pop_flag(args, "--daemon", False)
         is_wd, _, args = _pop_flag(args, "--watchdog", False)
+        standby_busy, _, args = _pop_flag(args, "--standby-if-busy", False)
         _, host_s, args = _pop_flag(args, "--host", True)
         _, port_s, args = _pop_flag(args, "--port", True)
         _, tok_s, args = _pop_flag(args, "--token", True)
         _, alias_s, args = _pop_flag(args, "--alias", True)
+        _, allow_relay_s, args = _pop_flag(args, "--allow-relay", True)
+        _, relay_ports_s, args = _pop_flag(args, "--relay-ports", True)
+        _, script_override_s, args = _pop_flag(args, "--script-path", True)
         host = host_s or "0.0.0.0"
         port = int(port_s) if port_s else 7777
+        if script_override_s:
+            global _EFFECTIVE_SCRIPT_PATH
+            _EFFECTIVE_SCRIPT_PATH = Path(script_override_s).resolve()
         tok = tok_s or load_or_create_daemon_token()
         if alias_s:
             with _STATE_LOCK:
@@ -3202,24 +4484,77 @@ def _handle_mgmt_command(cmd: str, args: list[str], explicit_to: str = "") -> in
                 topo["alias"] = alias_s
                 save_topology_state(topo)
         child_args = ["--listen", "--host", host, "--port", str(port), "--token", tok]
+        if allow_relay_s:
+            child_args.extend(["--allow-relay", allow_relay_s])
+        if relay_ports_s:
+            child_args.extend(["--relay-ports", relay_ports_s])
+        if script_override_s:
+            child_args.extend(["--script-path", script_override_s])
+        if standby_busy:
+            child_args.append("--standby-if-busy")
         if is_wd:
             child_args = ["--watchdog", *child_args]
         if is_daemon:
             log_p = get_state_dir() / f"listen-{port}.log"
             pid = _spawn_detached_self(child_args, log_p)
-            print(
-                json.dumps(
-                    {"ok": True, "pid": pid, "host": host, "port": port, "token": tok, "log": str(log_p)},
-                    indent=2,
-                    ensure_ascii=False,
-                )
-            )
+            out_doc: dict = {
+                "ok": True,
+                "pid": pid,
+                "host": host,
+                "port": port,
+                "token": tok,
+                "code_hash": CODE_HASH,
+                "log": str(log_p),
+            }
+            if allow_relay_s:
+                out_doc["allow_relay"] = allow_relay_s
+            print(json.dumps(out_doc, indent=2, ensure_ascii=False))
             return 0
         if is_wd:
             run_watchdog(child_args[1:])
         else:
-            run_http_listener(host=host, port=port, token=tok)
+            run_http_listener(
+                host=host,
+                port=port,
+                token=tok,
+                allow_relay=allow_relay_s,
+                relay_ports=relay_ports_s,
+                script_path_override=script_override_s,
+                standby_if_busy=standby_busy,
+            )
         return 0
+
+    if cmd == "upgrade":
+        all_flag, _, args = _pop_flag(args, "--all", False)
+        force_flag, _, args = _pop_flag(args, "--force", False)
+        _, ports_s, args = _pop_flag(args, "--ports", True)
+        cand_ports = _parse_port_list(ports_s, DEFAULT_CANDIDATE_PORTS)
+
+        if all_flag:
+            # Topological order: direct peers first, then multi-hop routes sorted by path length
+            direct_targets = sorted((state.get("peers") or {}).keys())
+            routed_items = sorted(
+                (state.get("routes") or {}).items(),
+                key=lambda kv: len((kv[1] or {}).get("path") or []),
+            )
+            targets = [*direct_targets, *[k for k, _ in routed_items if k not in direct_targets]]
+            if not targets:
+                print(json.dumps({"ok": True, "upgraded": [], "note": "no configured remote nodes"}, indent=2))
+                return 0
+            results = []
+            any_err = False
+            for tgt in targets:
+                r = _upgrade_single_target(tgt, cand_ports, force=force_flag, state=state)
+                results.append(r)
+                if not r.get("ok"):
+                    any_err = True
+            print(json.dumps({"ok": not any_err, "results": results}, indent=2, ensure_ascii=False))
+            return 1 if any_err else 0
+
+        tgt = explicit_to or (args[0] if args else _resolve_active_target("", state))
+        res = _upgrade_single_target(tgt, cand_ports, force=force_flag, state=state)
+        print(json.dumps(res, indent=2, ensure_ascii=False))
+        return 0 if res.get("ok") else 1
 
     if cmd == "dial":
         is_daemon, _, args = _pop_flag(args, "--daemon", False)
@@ -3267,6 +4602,24 @@ def _handle_mgmt_command(cmd: str, args: list[str], explicit_to: str = "") -> in
     is_local_flag, _, args = _pop_flag(args, "--local", False)
     target = "self" if is_local_flag else _resolve_active_target(explicit_to, state)
 
+    if cmd == "relay":
+        _, ports_s, args = _pop_flag(args, "--ports", True)
+        spec = args[0] if args else "status"
+        if _is_local_target(target, state):
+            try:
+                res = _handle_local_relay_config({"spec": spec, "ports": ports_s or None})
+                print(json.dumps(res, indent=2, ensure_ascii=False))
+                return 0
+            except Exception as e:
+                sys.stderr.write(f"[rmcp] :relay error: {e}\n")
+                return 1
+        resp = send_action(target, "relay_config", {"spec": spec, "ports": ports_s or None})
+        if not resp.get("ok"):
+            sys.stderr.write(f"[rmcp] :relay failed on '{target}': {resp.get('error')}\n")
+            return 1
+        print(json.dumps(resp.get("result"), indent=2, ensure_ascii=False))
+        return 0
+
     if cmd == "autostart":
         _, port_s, args = _pop_flag(args, "--port", True)
         _, host_s, args = _pop_flag(args, "--host", True)
@@ -3293,8 +4646,10 @@ def _handle_mgmt_command(cmd: str, args: list[str], explicit_to: str = "") -> in
         return 0
 
     if cmd in ("ping", "env"):
+        _, t_s, args = _pop_flag(args, "--timeout", True)
+        def_t = 10.0 if cmd == "ping" else 25.0
         tgt = explicit_to or (args[0] if args else target)
-        resp = send_action(tgt, cmd, {})
+        resp = send_action(tgt, cmd, {}, timeout=float(t_s) if t_s else def_t)
         if not resp.get("ok"):
             sys.stderr.write(f"[rmcp] :{cmd} failed on '{tgt}': {resp.get('error')}\n")
             return 1
@@ -3567,7 +4922,7 @@ def _setup_repl_readline():
         options: list[str] = []
         if buf.startswith(":") and " " not in buf:
             options = sorted(f":{c}" for c in _MGMT_COMMANDS if f":{c}".startswith(text.lower()))
-        elif buf.startswith((":use ", ":to ", ":ping ", ":env ", ":nodes ", ":disconnect ", ":rm ")):
+        elif buf.startswith((":use ", ":to ", ":ping ", ":env ", ":nodes ", ":disconnect ", ":rm ", ":upgrade ")):
             st = load_router_state()
             known = sorted(
                 {"self", *st.get("peers", {}).keys(), *st.get("routes", {}).keys()}
@@ -3758,7 +5113,9 @@ def cli_main(argv: list[str] | None = None) -> int:
         # Backward-compatibility for legacy agent.py supervisory loops (e.g. run-agent.cmd)
         inv_name = Path(sys.argv[0]).name.lower()
         if inv_name in ("agent.py", "remote-agent.py", "agent-server.py"):
-            return _handle_mgmt_command("listen", ["--host", "0.0.0.0", "--port", "7777"])
+            return _handle_mgmt_command(
+                "listen", ["--host", "0.0.0.0", "--port", "7777", "--standby-if-busy"]
+            )
         if _is_interactive_tty():
             return run_repl()
         _print_help()
@@ -3786,7 +5143,7 @@ def cli_main(argv: list[str] | None = None) -> int:
         return 0
 
     if raw[0] in ("-v", "--version"):
-        print(f"rmcp {VERSION}")
+        print(f"rmcp {VERSION} ({CODE_HASH})")
         return 0
 
     # 2. Optional leading `--to <target>`, `--timeout <sec>`, or `--session <name>` before command
