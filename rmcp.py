@@ -356,12 +356,22 @@ def load_topology_state() -> dict:
     legacy_cwds: dict[str, str] = dict(topo.get("cwds") or {})
 
     # Auto-import HTTP hosts from legacy hosts.json (non-destructively)
+    # Note: Skip aliases that are already registered as multi-hop routes (via another node)
+    # Also evict any peers that are now registered in routes
+    for r_alias in list(topo.get("routes", {}).keys()):
+        topo["peers"].pop(r_alias, None)
+
     hf = _legacy_hosts_file()
     if hf.exists():
         with contextlib.suppress(Exception):
             legacy = json.loads(hf.read_text(encoding="utf-8"))
             for alias, h in (legacy.get("hosts") or {}).items():
-                if alias not in topo["peers"] and isinstance(h, dict) and h.get("url"):
+                if (
+                    alias not in topo["peers"]
+                    and alias not in topo.get("routes", {})
+                    and isinstance(h, dict)
+                    and h.get("url")
+                ):
                     topo["peers"][alias] = {
                         "alias": alias,
                         "type": "http",
@@ -1851,6 +1861,21 @@ def _fallback_legacy_agent_http(peer: dict, env: dict, timeout: float = 120.0) -
             return {"ok": True, "node_id": peer.get("alias"), "via": via, "result": res}
         return {"ok": False, "error": f"/{action} {code}: {res}"}
 
+    if action == "upload_chunk":
+        if params.get("offset", 0) == 0 and params.get("finalize"):
+            code, res = _http_request_json(
+                base + "/write",
+                "POST",
+                tok,
+                {"path": params["path"], "cwd": params.get("cwd"), "data_b64": params["data_b64"]},
+                timeout=timeout,
+            )
+            if code == 200 and isinstance(res, dict):
+                res.setdefault("bytes", len(base64.b64decode(params["data_b64"])))
+                res.setdefault("sha256", params.get("sha256", ""))
+                return {"ok": True, "node_id": peer.get("alias"), "via": via, "result": res}
+            return {"ok": False, "error": f"legacy /write {code}: {res}"}
+
     if action == "list":
         code, res = _http_request_json(base + "/list", "GET", tok, timeout=timeout)
         if code == 200 and isinstance(res, dict):
@@ -1901,12 +1926,19 @@ def send_via_http(peer: dict, env: dict, timeout: float = 120.0) -> dict:
                 return {"ok": False, "error": f"response decryption failed: {e}"}
         return res
 
+    err_msg = res.get("error") if isinstance(res, dict) else str(res)
+
     # Automatic fallback for older v0.4 agent.py instances without /route
+    # Note: Older Windows agent.py closes connection on 404 without draining POST body,
+    # causing TCP RST (WinError 10054 / ConnectionResetError) on the client side.
     dst = env.get("dst")
-    if code == 404 and dst in ("self", peer.get("alias"), peer.get("node_id"), peer.get("hostname")):
+    is_reset_or_404 = (
+        code == 404
+        or (code == 0 and any(w in str(err_msg).lower() for w in ("10054", "reset", "closed", "broken pipe")))
+    )
+    if is_reset_or_404 and dst in ("self", peer.get("alias"), peer.get("node_id"), peer.get("hostname")):
         return _fallback_legacy_agent_http(peer, env, timeout=timeout)
 
-    err_msg = res.get("error") if isinstance(res, dict) else str(res)
     return {"ok": False, "error": f"HTTP {code} from {peer.get('alias')}: {err_msg}"}
 
 
@@ -2043,11 +2075,12 @@ def route_envelope(env: dict, timeout: float = 120.0) -> dict:
             if resp.get("ok") or resp.get("reached_dst"):
                 _learn_route(dst, nh, resp)
                 return resp
-            # Otherwise route is stale; evict and fall through to discovery flood
-            with _STATE_LOCK:
-                st2 = load_topology_state()
-                st2["routes"].pop(dst, None)
-                save_topology_state(st2)
+            # Otherwise dynamically learned route is stale; evict and fall through to discovery flood
+            if not cached.get("explicit"):
+                with _STATE_LOCK:
+                    st2 = load_topology_state()
+                    st2["routes"].pop(dst, None)
+                    save_topology_state(st2)
         else:
             rev_nh = _find_reverse_session(nh)
             if rev_nh is not None and nh not in via:
@@ -2123,7 +2156,7 @@ def connect_peer_local(
             "pkt_id": str(uuid.uuid4()),
             "ttl": 2,
             "src": load_router_state()["node_id"],
-            "dst": alias,
+            "dst": "self",
             "via": [],
             "action": "ping",
             "params": {},
@@ -2238,7 +2271,16 @@ def load_or_create_daemon_token(token_file: Path | None = None) -> str:
     env_tok = os.environ.get("REMOTE_AGENT_TOKEN") or os.environ.get("PI_REMOTE_AGENT_TOKEN")
     if env_tok:
         return env_tok.strip()
-    tf = token_file or (get_state_dir() / "agent.token")
+    if token_file:
+        tf = token_file
+    else:
+        # Prefer agent.token in same directory as the script (for legacy agent.py deployments)
+        local_tf = Path(__file__).resolve().parent / "agent.token"
+        if local_tf.exists():
+            tok = local_tf.read_text(encoding="utf-8").strip()
+            if tok:
+                return tok
+        tf = get_state_dir() / "agent.token"
     if tf.exists():
         tok = tf.read_text(encoding="utf-8").strip()
         if tok:
@@ -3062,7 +3104,9 @@ def _handle_mgmt_command(cmd: str, args: list[str], explicit_to: str = "") -> in
                         "node_id": info.get("node_id", ""),
                         "platform": info.get("platform", ""),
                         "updated_at": int(time.time()),
+                        "explicit": True,
                     }
+                    topo["peers"].pop(alias, None)
                 if not topo.get("default_active"):
                     topo["default_active"] = alias
                 save_topology_state(topo)
@@ -3706,6 +3750,10 @@ def cli_main(argv: list[str] | None = None) -> int:
     global _SESSION_OVERRIDE
     raw = list(sys.argv[1:] if argv is None else argv)
     if not raw:
+        # Backward-compatibility for legacy agent.py supervisory loops (e.g. run-agent.cmd)
+        inv_name = Path(sys.argv[0]).name.lower()
+        if inv_name in ("agent.py", "remote-agent.py", "agent-server.py"):
+            return _handle_mgmt_command("listen", ["--host", "0.0.0.0", "--port", "7777"])
         if _is_interactive_tty():
             return run_repl()
         _print_help()
